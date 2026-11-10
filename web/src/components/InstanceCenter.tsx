@@ -67,7 +67,7 @@ function errorText(cause: unknown): string {
 }
 
 export function InstanceCenter({ instances = [], onContinue, onOpenWorkbench, onRefresh }: InstanceCenterProps) {
-  const [filter, setFilter] = useState<Filter>('all');
+  const [filter, setFilter] = useState<Filter>('active');
   const [selectedId, setSelectedId] = useState('');
   const [detail, setDetail] = useState<Detail | null>(null);
   const [workbench, setWorkbench] = useState<GpuInstance | null>(null);
