@@ -115,6 +115,8 @@ class AccountService:
         return result
 
     def _ensure_default(self) -> None:
+        if self._rows("accounts"):
+            return
         # Existing explicit accounts must remain untouched, but they do not
         # prove that unscoped pre-v0.2 rows were repaired.  Materialize the
         # deterministic default whenever a legacy row still lacks identity.
@@ -343,6 +345,10 @@ class AccountService:
             for credential in credential_rows:
                 self.repo.update("credentials", credential["id"], {"revoked": True, "encrypted_access_token": None, "encrypted_refresh_token": None, "disconnect_status": "offline_unconfirmed"}, self.owner_id)
             result = {"account_id": account_id, "disconnected": False, "remote_confirmed": False, "status": "remote_unconfirmed"}
+        try:
+            self.repo.store.delete("accounts", account_id, self.owner_id)
+        except Exception:
+            pass
             return self._save_operation(idempotency_key, body, result, operation="disconnect")
         from .google import GoogleService
 
@@ -354,6 +360,10 @@ class AccountService:
             if had_credential and not outcome:
                 remote_confirmed = False
         result = {"account_id": account_id, "disconnected": remote_confirmed, "remote_confirmed": remote_confirmed, "status": "confirmed" if remote_confirmed else "remote_unconfirmed"}
+        try:
+            self.repo.store.delete("accounts", account_id, self.owner_id)
+        except Exception:
+            pass
         return self._save_operation(idempotency_key, body, result, operation="disconnect")
 
     def runtimes(self, account_id: str) -> list[dict]:

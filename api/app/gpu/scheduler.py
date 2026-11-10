@@ -1653,7 +1653,10 @@ class Scheduler:
             )
             return self._set_state(job, "failed", "GPU cleanup was refused", error_code="gpu_cleanup_refused")
         try:
-            status = provider.inspect(handle)
+            try:
+                status = provider.inspect(handle)
+            except Exception:
+                status = {}
             confirmed = bool(status.get("deleted"))
             if not confirmed:
                 response = provider.delete(handle)
@@ -1932,7 +1935,10 @@ class Scheduler:
             provider = self._provider(job)
             if getattr(provider, "is_mock", False) and hasattr(provider, "recover_handle"):
                 handle = provider.recover_handle(handle)
-            status = provider.inspect(handle)
+            try:
+                status = provider.inspect(handle)
+            except Exception:
+                status = {}
             confirmed = bool(status.get("deleted"))
             # A legacy/non-SQL test double has no durable claim.  Recheck at the
             # final pre-delete boundary; SQL callers are fenced by claim state.

@@ -92,8 +92,10 @@ def _validate_allocation(repo, user, policy: dict) -> dict:
             accounts = repo.list("accounts", user["id"])
         except (AttributeError, KeyError, TypeError, ValueError):
             accounts = []
-        if accounts and not any(_account_is_usable(item) for item in accounts):
+        usable = [item for item in accounts if _account_is_usable(item)]
+        if not usable:
             raise APIError("ACCOUNT_UNAVAILABLE", "没有允许分配且已授权的 Google 账号", 409)
+        checked["account_id"] = usable[0].get("id") or usable[0].get("account_id")
     return checked
 
 
@@ -220,6 +222,7 @@ def admit_job(st, user, body, key, *, validate_only=False):
             raise APIError("SCHEDULER_BUSY", "队列正在同步，请用相同幂等键稍后重试", 503, True)
         job, created = repo.create_job(user["id"], body, key, admitted={
             "execution_policy": policy,
+            "account_id": policy.get("account_id"),
             "requested_account_id": policy.get("account_id"),
             "requested_instance_id": policy.get("instance_id"),
             **(baseline_fields),
