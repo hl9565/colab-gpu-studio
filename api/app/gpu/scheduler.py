@@ -1844,6 +1844,9 @@ class Scheduler:
         instance_id = lease.get("instance_id")
         if not instance_id:
             instance_id = (lease.get("data") or {}).get("instance_id")
+        account_id = lease.get("account_id")
+        if not account_id:
+            account_id = (lease.get("data") or {}).get("account_id")
         if not (
             isinstance(owner_job_id, str)
             and isinstance(owner_id, str)
@@ -1856,6 +1859,7 @@ class Scheduler:
             "owner_id": owner_id,
             "provider": lease.get("provider", "mock"),
             "instance_id": instance_id,
+            "account_id": account_id,
         }
         handle = self._lease_handle(lease) or self._intent_handle(job, lease)
         if handle is None:
@@ -1882,7 +1886,13 @@ class Scheduler:
         # Retained-idle cleanup is a normal lease-expiry path, not an orphan
         # claim.  claim_orphan_lease deliberately rejects retained_idle so a
         # concurrent allocation cannot be mistaken for an orphan.
-        use_claim = claim_method and instance_id and durable_instance is not None and lease.get("state") != "idle"
+        if not job.get("account_id") and isinstance(durable_instance, dict):
+            job["account_id"] = durable_instance.get("account_id") or (durable_instance.get("data") or {}).get("account_id")
+        is_retained_idle = (
+            lease.get("state") == "idle"
+            or (isinstance(durable_instance, dict) and durable_instance.get("state") == "retained_idle")
+        )
+        use_claim = claim_method and instance_id and durable_instance is not None and not is_retained_idle
         claimed = claim_method(owner_id, lease["id"], instance_id, token, self.clock()) if use_claim else None
         if use_claim and not claimed:
             return False
@@ -1890,6 +1900,11 @@ class Scheduler:
             lease = claimed[0]
             instance = claimed[1]
             job["instance_id"] = instance_id
+            if not job.get("account_id"):
+                job["account_id"] = (
+                    lease.get("account_id")
+                    or (instance.get("account_id") if isinstance(instance, dict) else None)
+                )
             if instance and instance.get("version") is not None:
                 job["_cleanup_instance_version"] = instance["version"]
             handle = self._lease_handle(lease) or self._intent_handle(job, lease)
