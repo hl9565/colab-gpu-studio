@@ -93,14 +93,14 @@
       "length": {
         "type": "integer",
         "label": "帧数（24 帧/秒）",
-        "description": "124 帧约 5 秒；会向上取到 17k+5。",
+        "description": "124 帧约 5 秒，362 帧约 15 秒；会向上取到 17k+5。",
         "binding": {
           "node": "20",
           "input": "length"
         },
         "default": 124,
         "min": 22,
-        "max": 244,
+        "max": 362,
         "step": 17
       },
       "seed": {
