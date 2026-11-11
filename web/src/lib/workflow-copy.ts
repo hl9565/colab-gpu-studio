@@ -28,6 +28,10 @@ const FAMILY: Record<string, { title: string; usage: string }> = {
     title: '多参考图生视频',
     usage: '上传参考图锁定人物和画风，生成带声音的短视频。至少需要第一张参考图。',
   },
+  'minimax-h3-relay': {
+    title: '多段无缝长视频（H3 接力）',
+    usage: '上传 1~3 张参考图，用 --- 分隔多段提示词，潜空间直传连跑拼成超过 15 秒的有声长镜头。',
+  },
 };
 
 function readable(value: unknown): string {

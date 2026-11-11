@@ -8,6 +8,7 @@ EXPECTED = {
     ("krea2-moss-dual-t2i", "1.1.1"),
     ("minimax-h3-i2v", "1.1.0"),
     ("minimax-h3-ref2v", "1.4.0"),
+    ("minimax-h3-relay", "1.0.0"),
 }
 
 
@@ -51,7 +52,7 @@ def test_builtin_records_are_owner_scoped():
     registry.bootstrap("second-owner")
     first = registry.workflows("first-owner")
     second = registry.workflows("second-owner")
-    assert len(first) == len(second) == 6
+    assert len(first) == len(second) == 7
     assert {r["id"] for r in first}.isdisjoint(r["id"] for r in second)
     assert all(r["owner_id"] == "second-owner" for r in second)
 
@@ -138,7 +139,7 @@ def test_catalog_bootstrap_never_calls_external_services(monkeypatch):
     monkeypatch.setattr(httpx.Client, "request", reject)
     registry = Registry(Repository(Store("sqlite:///:memory:")))
     registry.bootstrap("offline-owner")
-    assert len(registry.workflows("offline-owner")) == 6
+    assert len(registry.workflows("offline-owner")) == 7
 
 
 def test_every_bundled_lora_node_is_shipped_or_refused():
@@ -202,3 +203,27 @@ def test_bundle_loader_rejects_unshipped_lora(tmp_path, monkeypatch):
     finally:
         builtin._bundles.cache_clear()  # noqa: SLF001
 
+
+
+def test_h3_relay_modes_and_segments_bind_without_running_models():
+    import json
+    from pathlib import Path
+
+    from app.gpu import builtin
+    from app.gpu.manifest import bind_parameters, resolve_parameters
+
+    root = Path(builtin.__file__).with_name("templates") / "builtin"
+    bundle = json.loads((root / "minimax-h3-relay-1.0.0.json").read_text(encoding="utf-8"))
+    manifest = bundle["manifest"]
+    for mode in ("fast", "fast8", "hq"):
+        params = resolve_parameters(
+            manifest,
+            {"ref_1": "reference-asset", "mode": mode, "segments": 3, "length": 192, "seed": 7},
+        )
+        graph = bind_parameters(manifest, bundle["api_graph"], params)
+        assert graph["25"]["inputs"]["segments"] == 3
+        assert graph["25"]["inputs"]["length"] == 192
+        assert "ref_image_1" in graph["25"]["inputs"]
+        assert "ref_image_2" not in graph["25"]["inputs"]
+        assert "ref_image_3" not in graph["25"]["inputs"]
+        assert graph["22"]["inputs"]["steps"] == {"fast": 4, "fast8": 8, "hq": 20}[mode]

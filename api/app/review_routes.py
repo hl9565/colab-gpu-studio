@@ -55,6 +55,10 @@ _REQUIRED_CUSTOM_NODE_PINS = {
         "https://github.com/huwhitememes/comfyui-krea2-conditioning",
         "729cda4fade982988a375b01928f515458407a5c",
     ),
+    "H3RelayFiniteRun": (
+        "https://github.com/ZenHG/ComfyUI-H3-Latent-Relay",
+        "054936a5313fe94902e2d7fd672754691beff320",
+    ),
 }
 
 

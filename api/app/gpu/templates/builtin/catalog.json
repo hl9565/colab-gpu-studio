@@ -35,6 +35,13 @@
       "version": "1.1.1",
       "model_id": "krea2-moss-dual",
       "title": "Krea-2 Turbo + MOSS 电影胶片双采（4 个公开 LoRA）"
+    },
+    {
+      "file": "minimax-h3-relay-1.0.0.json",
+      "workflow_key": "minimax-h3-relay",
+      "version": "1.0.0",
+      "model_id": "minimax-h3",
+      "title": "MiniMax H3 多段无缝长视频（Latent 接力）"
     }
   ]
 }

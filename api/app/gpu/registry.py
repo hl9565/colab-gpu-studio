@@ -17,6 +17,16 @@ _SEMVER = re.compile(r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z.-
 # a fixed review boundary, not a client-provided allowlist.
 _PUBLISH_NODE_ALLOWLIST = {
     "MinimaxH3LatentUpscaler3DRefineHandoff",  # pinned + reviewed custom node (runtime_worker.REVIEWED_CUSTOM_NODES)
+    # ComfyUI-H3-Latent-Relay reviewed nodes (runtime_worker.REVIEWED_CUSTOM_NODES)
+    "H3RelayFiniteRun",
+    "H3RelayCopyBridge",
+    "H3RelayLatentSave",
+    "H3RelayLatentLoad",
+    "H3RelayTrimAV",
+    "H3RelayJoinAV",
+    "H3RelayAudioSeam",
+    "H3RelayPost",
+    "H3RelaySeedFromVideo",
     "CheckpointLoaderSimple",
     "CLIPTextEncode",
     "KSampler",

@@ -66,7 +66,7 @@ function widgetOf(parameter: GpuParameter): string {
 }
 
 const TECH_KEYS = /(^|_)(steps?|seed|cfg|cfg_scale|sampler|sampler_name|scheduler|denoise|clip_skip|negative|strength|weight)(_|$)/i;
-const COMMON_KEYS = /(^|_)(mode|duration|seconds|length|quality|fps)(_|$)/i;
+const COMMON_KEYS = /(^|_)(mode|duration|seconds|length|segments|video_vae|quality|fps)(_|$)/i;
 
 /** 把参数分成三层：素材、常用选项、高级。常用选项只放“模式 / 时长”这类会明显改变结果的下拉项。 */
 export function splitParams(manifest: GpuManifest | null | undefined, excludeKeys: string[] = []) {

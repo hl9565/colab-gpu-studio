@@ -12,7 +12,7 @@ import copy
 
 MAX_LORAS = 3
 MAX_BYTES = 1_500_000_000
-H3_WORKFLOWS = {"minimax-h3-i2v", "minimax-h3-ref2v"}
+H3_WORKFLOWS = {"minimax-h3-i2v", "minimax-h3-ref2v", "minimax-h3-relay"}
 
 CURATED = [
     {
@@ -20,7 +20,7 @@ CURATED = [
         "label": "2D 动漫/CG 风格锁定滑块（防偏 3D 真人）",
         "note": "控制整体风格偏向 2D 动漫/CG 或写实，防止二次元 CG 参考图动起来变成 3D/真人感。无需触发词，推荐强度 1.0–3.0（默认 1.5）。",
         "strength": 1.5,
-        "workflows": ["minimax-h3-ref2v"],
+        "workflows": ["minimax-h3-ref2v", "minimax-h3-relay"],
         "url": "https://huggingface.co/RunningHubAI/rh-minmax-h3-2d-lora",
         "repo_id": "RunningHubAI/rh-minmax-h3-2d-lora",
         "filename": "H3_Ref2V_Anime_Slider_v1.safetensors",
@@ -33,7 +33,7 @@ CURATED = [
         "label": "CG 动态壁纸 R64（运镜+微动）",
         "note": "适合立绘/CG 微动（发丝、裙摆、光效、呼吸）且镜头听从提示词。提示词建议以 “live_wallpaper: Animate <Picture 1> with ...” 开头；推荐强度 0.8–1.0。",
         "strength": 1.0,
-        "workflows": ["minimax-h3-ref2v"],
+        "workflows": ["minimax-h3-ref2v", "minimax-h3-relay"],
         "url": "https://huggingface.co/Alissonerdx/Minimax-H3-ComfyUI",
         "repo_id": "Alissonerdx/Minimax-H3-ComfyUI",
         "filename": "loras/minimax_h3_live_wallpaper_v1.0_ref2va_r64.safetensors",
@@ -46,7 +46,7 @@ CURATED = [
         "label": "CG 动态壁纸 R32（更保五官）",
         "note": "适合单张或多张 CG 微动，五官还原更稳（镜头移动随机性稍高）。提示词建议以 “live_wallpaper: Animate <Picture 1> with ...” 开头；推荐强度 0.8–1.0。",
         "strength": 0.9,
-        "workflows": ["minimax-h3-ref2v"],
+        "workflows": ["minimax-h3-ref2v", "minimax-h3-relay"],
         "url": "https://huggingface.co/Alissonerdx/Minimax-H3-ComfyUI",
         "repo_id": "Alissonerdx/Minimax-H3-ComfyUI",
         "filename": "loras/minimax_h3_live_wallpaper_v1.0_ref2va_r32.safetensors",
@@ -59,7 +59,7 @@ CURATED = [
         "label": "Anti-Burn（多段续拍防脸崩/防发焦）",
         "note": "用上一段视频尾帧续拍第 2、3、4 段时挂上，防止脸部和线条越来越锐化发焦。第一段不要挂！推荐强度 0.5。",
         "strength": 0.5,
-        "workflows": ["minimax-h3-i2v", "minimax-h3-ref2v"],
+        "workflows": ["minimax-h3-i2v", "minimax-h3-ref2v", "minimax-h3-relay"],
         "url": "https://huggingface.co/Imagineer13/H3-Anti-Burn-LoRA",
         "repo_id": "Imagineer13/H3-Anti-Burn-LoRA",
         "filename": "h3_antiburn_universal_v1.safetensors",
@@ -72,7 +72,7 @@ CURATED = [
         "label": "Better Human Motion（动作更自然）",
         "note": "人物肢体动作更自然连贯。作者建议 0.4–0.8；提示词写短句，避免串词。训练于 T2V/I2V，二次元 CG 慎叠。",
         "strength": 0.6,
-        "workflows": ["minimax-h3-i2v", "minimax-h3-ref2v"],
+        "workflows": ["minimax-h3-i2v", "minimax-h3-ref2v", "minimax-h3-relay"],
         "url": "https://huggingface.co/vpakarinen/better-human-motion-h3-lora",
         "repo_id": "vpakarinen/better-human-motion-h3-lora",
         "filename": "better_motion_h3_lora_v1_500.safetensors",
@@ -85,7 +85,7 @@ CURATED = [
         "label": "Motion Continuity Repair V2（防动作崩）",
         "note": "修复转身、翻滚、跳跃等大动作的断裂和慢动作感；原片已经正常时效果不明显。作者建议单独用约 0.9，不要与其他动作 LoRA 混叠。",
         "strength": 0.9,
-        "workflows": ["minimax-h3-i2v", "minimax-h3-ref2v"],
+        "workflows": ["minimax-h3-i2v", "minimax-h3-ref2v", "minimax-h3-relay"],
         "url": "https://huggingface.co/JOKER141/MiniMax-H3-General-Motion-Continuity-Repair",
         "repo_id": "JOKER141/MiniMax-H3-General-Motion-Continuity-Repair",
         "filename": "Motion_Repair_V2.safetensors",
@@ -98,7 +98,7 @@ CURATED = [
         "label": "Camera Motion（运镜）",
         "note": "推近、拉远、环绕、手持跟拍等运镜。提示词必须以 “camera motion,” 开头；作者建议 0.8–1.0，超过 1.2 画面会不稳。",
         "strength": 0.8,
-        "workflows": ["minimax-h3-i2v", "minimax-h3-ref2v"],
+        "workflows": ["minimax-h3-i2v", "minimax-h3-ref2v", "minimax-h3-relay"],
         "url": "https://huggingface.co/Jojocodex/minimax-h3-Camera-Motion-lora",
         "repo_id": "Jojocodex/minimax-h3-Camera-Motion-lora",
         "filename": "camera_motion_h3_lora_v1_1000_pruned.safetensors",

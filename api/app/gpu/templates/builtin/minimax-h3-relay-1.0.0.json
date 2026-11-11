@@ -1,0 +1,1538 @@
+{
+  "workflow_key": "minimax-h3-relay",
+  "model_id": "minimax-h3",
+  "model": {
+    "model_id": "minimax-h3",
+    "display_name": "MiniMax H3 图生视频（带声音）",
+    "revision": "54472221d27c695fca9621b0c3ed52f06c4af707",
+    "source": "https://huggingface.co/Comfy-Org/MiniMax-H3",
+    "license": "minimax-h3-community-license-agreement",
+    "modality": "video",
+    "resource_profile": {
+      "disk_gb": 44,
+      "weights_gb": 40.1,
+      "min_vram_gb": 24,
+      "min_ram_gb": 40
+    },
+    "variants": [
+      "H3 FL2VA int8_convrot + qwen3vl-32b nvfp4 编码器 + Lightning 8 步 LoRA（L4）"
+    ]
+  },
+  "manifest": {
+    "workflow_key": "minimax-h3-relay",
+    "model_id": "minimax-h3",
+    "version": "1.0.0",
+    "title": "MiniMax H3 多段无缝长视频（Latent 接力）",
+    "description": "基于 H3-Latent-Relay 潜空间直传与音画同裁，一次提交连跑多段（突破 15 秒上限）无缝拼成一条有声长视频。多段提示词用单独一行 --- 分隔，全片共用 1~3 张参考图锁人锁景；在 Colab L4 上运行。",
+    "modality": "video",
+    "executor": "comfyui",
+    "compute_spec": {
+      "variant": "VARIANT_GPU",
+      "accelerator": "L4",
+      "shape": "SHAPE_STANDARD"
+    },
+    "max_runtime_minutes": 120,
+    "parameters": {
+      "ref_1": {
+        "type": "image",
+        "label": "参考图 1（对应 <Picture 1>）",
+        "description": "人物或场景主参考图（必填，全片各段共用）。",
+        "binding": {
+          "node": "1",
+          "input": "image"
+        },
+        "required": true,
+        "slot_group": "refs",
+        "max_edge": 768
+      },
+      "ref_2": {
+        "type": "image",
+        "label": "参考图 2（对应 <Picture 2>）",
+        "description": "可选第二张参考图（如第二位角色或服装）。",
+        "binding": {
+          "node": "2",
+          "input": "image"
+        },
+        "required": false,
+        "slot_group": "refs",
+        "max_edge": 768
+      },
+      "ref_3": {
+        "type": "image",
+        "label": "参考图 3（对应 <Picture 3>）",
+        "description": "可选第三张参考图（如场景环境参考）。",
+        "binding": {
+          "node": "3",
+          "input": "image"
+        },
+        "required": false,
+        "slot_group": "refs",
+        "max_edge": 768
+      },
+      "mode": {
+        "type": "enum",
+        "label": "模式",
+        "description": "8 步 v1.1（Shift 6/3）保五官与连续动作最稳；高质量 20 步不使用加速 LoRA。",
+        "default": "fast8",
+        "options": [
+          {
+            "value": "fast",
+            "label": "快速 4步"
+          },
+          {
+            "value": "fast8",
+            "label": "快速 8步 v1.1"
+          },
+          {
+            "value": "hq",
+            "label": "高质量 20步"
+          }
+        ],
+        "typical_minutes": {
+          "fast": 13,
+          "fast8": 16,
+          "hq": 24
+        },
+        "variants": {
+          "fast": {},
+          "fast8": {
+            "set": {
+              "11": {
+                "lora_name": "minimax_h3_ref2v_turbo_8step_v1.1_768p_comfyui_bf16.safetensors"
+              },
+              "15": {
+                "shift_video": 6.0,
+                "shift_audio": 3.0
+              },
+              "22": {
+                "steps": 8
+              }
+            }
+          },
+          "hq": {
+            "set": {
+              "21": {
+                "sampler_name": "res_multistep"
+              },
+              "22": {
+                "model": [
+                  "10",
+                  0
+                ],
+                "steps": 20
+              },
+              "25": {
+                "model": [
+                  "10",
+                  0
+                ]
+              }
+            },
+            "drop": [
+              "15",
+              "11"
+            ]
+          }
+        },
+        "choices": [
+          "fast",
+          "fast8",
+          "hq"
+        ]
+      },
+      "segments": {
+        "type": "integer",
+        "label": "连跑段数",
+        "description": "一次提交连续跑几段并无缝拼成一条视频（填 N 时，提示词请用单独一行 --- 分成 N 段）。",
+        "binding": {
+          "node": "25",
+          "input": "segments"
+        },
+        "default": 2,
+        "min": 1,
+        "max": 8,
+        "step": 1
+      },
+      "length": {
+        "type": "integer",
+        "label": "每段帧数（24 帧/秒）",
+        "description": "124 帧≈5秒，192 帧≈8秒，260 帧≈11秒，362 帧≈15秒（严格落在 5+17k 网格上）；第 2 段起自动裁掉重叠帧。",
+        "binding": {
+          "node": "25",
+          "input": "length"
+        },
+        "default": 124,
+        "min": 22,
+        "max": 362,
+        "step": 17
+      },
+      "video_vae": {
+        "type": "enum",
+        "label": "视频 VAE（画风解码）",
+        "description": "二次元/漫剧推荐无缝 VAE；真人写实短剧建议切回官方原版 VAE。",
+        "binding": {
+          "node": "13",
+          "input": "vae_name"
+        },
+        "default": "minimax_h3_video_vae_dully_seamless_v1_int8convrot.safetensors",
+        "options": [
+          {
+            "value": "minimax_h3_video_vae_dully_seamless_v1_int8convrot.safetensors",
+            "label": "二次元/CG 无缝 VAE（推荐）"
+          },
+          {
+            "value": "minimax_h3_video_vae_int8_convrot.safetensors",
+            "label": "官方原版 VAE（真人写实）"
+          }
+        ],
+        "choices": [
+          "minimax_h3_video_vae_dully_seamless_v1_int8convrot.safetensors",
+          "minimax_h3_video_vae_int8_convrot.safetensors"
+        ]
+      },
+      "prompts": {
+        "type": "string",
+        "label": "多段提示词（用 --- 分隔每段）",
+        "description": "每段一块提示词，段间用单独一行 --- 分隔；用 <Picture 1>、<Picture 2> 引用参考图，每段建议一镜到底并写明 Audio:。",
+        "binding": {
+          "node": "25",
+          "input": "prompts"
+        },
+        "required": true,
+        "default": "<Picture 1> moves naturally with smooth camera motion in the scene. Audio: gentle ambient room tone.\n---\n<Picture 1> continues moving smoothly in the same space without camera cuts. Audio: continuous ambient room tone."
+      },
+      "width": {
+        "type": "integer",
+        "label": "宽",
+        "description": "必须是 32 的倍数。",
+        "binding": {
+          "node": "25",
+          "input": "width"
+        },
+        "default": 544,
+        "min": 256,
+        "max": 1088,
+        "step": 32
+      },
+      "height": {
+        "type": "integer",
+        "label": "高",
+        "description": "必须是 32 的倍数。",
+        "binding": {
+          "node": "25",
+          "input": "height"
+        },
+        "default": 960,
+        "min": 256,
+        "max": 1088,
+        "step": 32
+      },
+      "context_frames": {
+        "type": "integer",
+        "label": "重叠钉住帧数",
+        "description": "从上一段尾部拷贝钉住多少帧过渡（默认 22 帧≈0.9 秒最稳，5+17k 网格）。",
+        "binding": {
+          "node": "25",
+          "input": "context_frames"
+        },
+        "default": 22,
+        "min": 5,
+        "max": 124,
+        "step": 17,
+        "advanced": true
+      },
+      "settle_frames": {
+        "type": "integer",
+        "label": "接缝沉降裁剪（同机位 0 / 换镜 -1）",
+        "description": "同机位一镜到底保持 0（最平滑）；跨段切机位可填 -1 自动退回段边界。",
+        "binding": {
+          "node": "25",
+          "input": "settle_frames"
+        },
+        "default": 0,
+        "min": -1,
+        "max": 36,
+        "step": 1,
+        "advanced": true
+      },
+      "refs_mode": {
+        "type": "enum",
+        "label": "参考图续接策略",
+        "description": "lock（默认）= 全片每段锁定同一组参考图；first_only = 仅首段喂参考图，后续段靠潜空间延续。",
+        "binding": {
+          "node": "25",
+          "input": "refs_mode"
+        },
+        "default": "lock",
+        "options": [
+          {
+            "value": "lock",
+            "label": "全片锁定参考图（lock，推荐）"
+          },
+          {
+            "value": "first_only",
+            "label": "仅首段用参考图（first_only）"
+          }
+        ],
+        "choices": [
+          "lock",
+          "first_only"
+        ],
+        "advanced": true
+      },
+      "ref_anchor_mode": {
+        "type": "enum",
+        "label": "潜空间外观锚",
+        "description": "off（默认，配 lock）；first = 锚定首段；roll = 滚动锚定上一段（建议配 first_only）。",
+        "binding": {
+          "node": "25",
+          "input": "ref_anchor_mode"
+        },
+        "default": "off",
+        "options": [
+          {
+            "value": "off",
+            "label": "关闭（off）"
+          },
+          {
+            "value": "first",
+            "label": "锚定首段（first）"
+          },
+          {
+            "value": "roll",
+            "label": "滚动锚定上段（roll）"
+          }
+        ],
+        "choices": [
+          "off",
+          "first",
+          "roll"
+        ],
+        "advanced": true
+      },
+      "seed": {
+        "type": "integer",
+        "label": "随机种子",
+        "description": "-1 表示每次随机。",
+        "binding": {
+          "node": "25",
+          "input": "seed"
+        },
+        "default": -1,
+        "min": 0,
+        "max": 4294967295,
+        "advanced": true
+      }
+    },
+    "dependencies": {
+      "comfyui_commit": "2c75dc1b379a59e0880619d029607af5169a62ef",
+      "custom_nodes": [
+        {
+          "repo": "https://github.com/ZenHG/ComfyUI-H3-Latent-Relay",
+          "commit": "054936a5313fe94902e2d7fd672754691beff320",
+          "dir": "ComfyUI-H3-Latent-Relay"
+        }
+      ],
+      "weight_files": [
+        {
+          "repo_id": "Comfy-Org/MiniMax-H3",
+          "filename": "diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors",
+          "revision": "54472221d27c695fca9621b0c3ed52f06c4af707",
+          "sha256": "9255f52b6677845ad238f20dfaafa94727053694127ab7f255c048f0f9365779",
+          "size": 20970379616,
+          "target": "diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors"
+        },
+        {
+          "repo_id": "Comfy-Org/MiniMax-H3",
+          "filename": "loras/minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors",
+          "revision": "54472221d27c695fca9621b0c3ed52f06c4af707",
+          "sha256": "5b9ab5ade15d0775676d01a907268a69a1468dc6033b3b0d3ded5502f3ebb84c",
+          "size": 1956193000,
+          "target": "loras/minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors"
+        },
+        {
+          "repo_id": "Comfy-Org/MiniMax-H3",
+          "filename": "text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+          "revision": "54472221d27c695fca9621b0c3ed52f06c4af707",
+          "sha256": "35a88d51044231fe332301d7a62aa81e3f2cba62febeb446e2c1e3e0ef76f2c6",
+          "size": 15687142551,
+          "target": "text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors"
+        },
+        {
+          "repo_id": "Comfy-Org/MiniMax-H3",
+          "filename": "vae/minimax_h3_video_vae_int8_convrot.safetensors",
+          "revision": "54472221d27c695fca9621b0c3ed52f06c4af707",
+          "sha256": "52a2c8c73583c86e4f41cdcce3a6ad0ea562987bc0bf3d60a0cef5f5c8e60c0e",
+          "size": 2811065184,
+          "target": "vae/minimax_h3_video_vae_int8_convrot.safetensors"
+        },
+        {
+          "repo_id": "Comfy-Org/MiniMax-H3",
+          "filename": "vae/minimax_h3_audio_vae_fp32.safetensors",
+          "revision": "54472221d27c695fca9621b0c3ed52f06c4af707",
+          "sha256": "8e505d95dd1561d47abd43d4238fd40d9bb1ae9e147ed0a4cba778d76ae4db48",
+          "size": 605254808,
+          "target": "vae/minimax_h3_audio_vae_fp32.safetensors"
+        },
+        {
+          "repo_id": "lightx2v/Minimax-h3-Turbo",
+          "filename": "minimax_h3_ref2v_turbo_8step_v1.1_768p_comfyui_bf16.safetensors",
+          "revision": "30f485ed874aa44c8183348ad361c5eabad318da",
+          "sha256": "e56863a7524e0300729cbb7b64cc8b548d90698c1abbf7d83898b0122fbe1e81",
+          "size": 1956193000,
+          "target": "loras/minimax_h3_ref2v_turbo_8step_v1.1_768p_comfyui_bf16.safetensors"
+        },
+        {
+          "repo_id": "dully3865/Minimax_H3_seamless_anime_VAE",
+          "filename": "minimax_h3_video_vae_dully_seamless_v1_int8convrot.safetensors",
+          "revision": "4609f584edd71b7e706e5610bc29b10dfd561b9d",
+          "sha256": "1830b4fca53fb1b0ef8cee5cdf9c95795d6536880c24a006ab4d43e04ad77818",
+          "size": 2795769552,
+          "target": "vae/minimax_h3_video_vae_dully_seamless_v1_int8convrot.safetensors"
+        }
+      ]
+    },
+    "manifest_version": 1,
+    "node_allowlist": [
+      "BasicScheduler",
+      "CLIPLoader",
+      "CreateVideo",
+      "H3RelayFiniteRun",
+      "KSamplerSelect",
+      "LoadImage",
+      "LoraLoaderModelOnly",
+      "MiniMaxH3SigmaShift",
+      "SaveVideo",
+      "UNETLoader",
+      "VAELoader"
+    ],
+    "comfyui_commit": "2c75dc1b379a59e0880619d029607af5169a62ef",
+    "comfy_commit": "2c75dc1b379a59e0880619d029607af5169a62ef",
+    "custom_nodes": [
+      {
+        "repo": "https://github.com/ZenHG/ComfyUI-H3-Latent-Relay",
+        "commit": "054936a5313fe94902e2d7fd672754691beff320",
+        "dir": "ComfyUI-H3-Latent-Relay"
+      }
+    ],
+    "weight_files": [
+      {
+        "repo_id": "Comfy-Org/MiniMax-H3",
+        "filename": "diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors",
+        "revision": "54472221d27c695fca9621b0c3ed52f06c4af707",
+        "sha256": "9255f52b6677845ad238f20dfaafa94727053694127ab7f255c048f0f9365779",
+        "size": 20970379616,
+        "target": "diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors"
+      },
+      {
+        "repo_id": "Comfy-Org/MiniMax-H3",
+        "filename": "loras/minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors",
+        "revision": "54472221d27c695fca9621b0c3ed52f06c4af707",
+        "sha256": "5b9ab5ade15d0775676d01a907268a69a1468dc6033b3b0d3ded5502f3ebb84c",
+        "size": 1956193000,
+        "target": "loras/minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors"
+      },
+      {
+        "repo_id": "Comfy-Org/MiniMax-H3",
+        "filename": "text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+        "revision": "54472221d27c695fca9621b0c3ed52f06c4af707",
+        "sha256": "35a88d51044231fe332301d7a62aa81e3f2cba62febeb446e2c1e3e0ef76f2c6",
+        "size": 15687142551,
+        "target": "text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors"
+      },
+      {
+        "repo_id": "Comfy-Org/MiniMax-H3",
+        "filename": "vae/minimax_h3_video_vae_int8_convrot.safetensors",
+        "revision": "54472221d27c695fca9621b0c3ed52f06c4af707",
+        "sha256": "52a2c8c73583c86e4f41cdcce3a6ad0ea562987bc0bf3d60a0cef5f5c8e60c0e",
+        "size": 2811065184,
+        "target": "vae/minimax_h3_video_vae_int8_convrot.safetensors"
+      },
+      {
+        "repo_id": "Comfy-Org/MiniMax-H3",
+        "filename": "vae/minimax_h3_audio_vae_fp32.safetensors",
+        "revision": "54472221d27c695fca9621b0c3ed52f06c4af707",
+        "sha256": "8e505d95dd1561d47abd43d4238fd40d9bb1ae9e147ed0a4cba778d76ae4db48",
+        "size": 605254808,
+        "target": "vae/minimax_h3_audio_vae_fp32.safetensors"
+      },
+      {
+        "repo_id": "lightx2v/Minimax-h3-Turbo",
+        "filename": "minimax_h3_ref2v_turbo_8step_v1.1_768p_comfyui_bf16.safetensors",
+        "revision": "30f485ed874aa44c8183348ad361c5eabad318da",
+        "sha256": "e56863a7524e0300729cbb7b64cc8b548d90698c1abbf7d83898b0122fbe1e81",
+        "size": 1956193000,
+        "target": "loras/minimax_h3_ref2v_turbo_8step_v1.1_768p_comfyui_bf16.safetensors"
+      },
+      {
+        "repo_id": "dully3865/Minimax_H3_seamless_anime_VAE",
+        "filename": "minimax_h3_video_vae_dully_seamless_v1_int8convrot.safetensors",
+        "revision": "4609f584edd71b7e706e5610bc29b10dfd561b9d",
+        "sha256": "1830b4fca53fb1b0ef8cee5cdf9c95795d6536880c24a006ab4d43e04ad77818",
+        "size": 2795769552,
+        "target": "vae/minimax_h3_video_vae_dully_seamless_v1_int8convrot.safetensors"
+      }
+    ]
+  },
+  "api_graph": {
+    "1": {
+      "class_type": "LoadImage",
+      "inputs": {
+        "image": "input_ref_1.jpg"
+      }
+    },
+    "2": {
+      "class_type": "LoadImage",
+      "inputs": {
+        "image": "input_ref_2.jpg"
+      }
+    },
+    "3": {
+      "class_type": "LoadImage",
+      "inputs": {
+        "image": "input_ref_3.jpg"
+      }
+    },
+    "10": {
+      "class_type": "UNETLoader",
+      "inputs": {
+        "unet_name": "minimax_h3_ref2va_pruned_int8_convrot.safetensors",
+        "weight_dtype": "default"
+      }
+    },
+    "11": {
+      "class_type": "LoraLoaderModelOnly",
+      "inputs": {
+        "model": [
+          "10",
+          0
+        ],
+        "lora_name": "minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors",
+        "strength_model": 1.0
+      }
+    },
+    "12": {
+      "class_type": "CLIPLoader",
+      "inputs": {
+        "clip_name": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+        "type": "minimax",
+        "device": "default"
+      }
+    },
+    "13": {
+      "class_type": "VAELoader",
+      "inputs": {
+        "vae_name": "minimax_h3_video_vae_dully_seamless_v1_int8convrot.safetensors"
+      }
+    },
+    "14": {
+      "class_type": "VAELoader",
+      "inputs": {
+        "vae_name": "minimax_h3_audio_vae_fp32.safetensors"
+      }
+    },
+    "15": {
+      "class_type": "MiniMaxH3SigmaShift",
+      "inputs": {
+        "model": [
+          "11",
+          0
+        ],
+        "shift_video": 12.0,
+        "shift_audio": 3.0
+      }
+    },
+    "21": {
+      "class_type": "KSamplerSelect",
+      "inputs": {
+        "sampler_name": "euler"
+      }
+    },
+    "22": {
+      "class_type": "BasicScheduler",
+      "inputs": {
+        "model": [
+          "15",
+          0
+        ],
+        "scheduler": "simple",
+        "steps": 4,
+        "denoise": 1.0
+      }
+    },
+    "25": {
+      "class_type": "H3RelayFiniteRun",
+      "inputs": {
+        "model": [
+          "15",
+          0
+        ],
+        "clip": [
+          "12",
+          0
+        ],
+        "vae": [
+          "13",
+          0
+        ],
+        "audio_vae": [
+          "14",
+          0
+        ],
+        "sampler": [
+          "21",
+          0
+        ],
+        "sigmas": [
+          "22",
+          0
+        ],
+        "prompt": "",
+        "segments": 2,
+        "seed": 1,
+        "run_id": "studio_relay",
+        "width": 544,
+        "height": 960,
+        "length": 124,
+        "context_frames": 22,
+        "mask_mode": "hard",
+        "pin_audio": true,
+        "ref_image_1": [
+          "1",
+          0
+        ],
+        "ref_image_2": [
+          "2",
+          0
+        ],
+        "ref_image_3": [
+          "3",
+          0
+        ],
+        "prompts": "<Picture 1> moves naturally with smooth camera motion in the scene. Audio: gentle ambient room tone.\n---\n<Picture 1> continues moving smoothly in the same space without camera cuts. Audio: continuous ambient room tone.",
+        "note": "",
+        "settle_frames": 0,
+        "from_segment": 0,
+        "ref_image_size": "match",
+        "refs_mode": "lock",
+        "ref_anchor_mode": "off",
+        "ref_anchor_frames": 5
+      }
+    },
+    "28": {
+      "class_type": "CreateVideo",
+      "inputs": {
+        "images": [
+          "25",
+          1
+        ],
+        "fps": 24.0,
+        "audio": [
+          "25",
+          2
+        ]
+      }
+    },
+    "29": {
+      "class_type": "SaveVideo",
+      "inputs": {
+        "video": [
+          "28",
+          0
+        ],
+        "filename_prefix": "video/MiniMax_H3_Relay",
+        "format": "auto",
+        "format.codec": "auto"
+      }
+    }
+  },
+  "object_info": {
+    "BasicScheduler": {
+      "input": {
+        "required": {
+          "model": [
+            "MODEL",
+            {}
+          ],
+          "scheduler": [
+            "COMBO",
+            {
+              "multiselect": false,
+              "options": [
+                "simple",
+                "sgm_uniform",
+                "karras",
+                "exponential",
+                "ddim_uniform",
+                "beta",
+                "normal",
+                "linear_quadratic",
+                "kl_optimal"
+              ]
+            }
+          ],
+          "steps": [
+            "INT",
+            {
+              "default": 20,
+              "min": 1,
+              "max": 10000
+            }
+          ],
+          "denoise": [
+            "FLOAT",
+            {
+              "default": 1.0,
+              "min": 0.0,
+              "max": 1.0,
+              "step": 0.01
+            }
+          ]
+        }
+      },
+      "input_order": {
+        "required": [
+          "model",
+          "scheduler",
+          "steps",
+          "denoise"
+        ]
+      },
+      "is_input_list": false,
+      "output": [
+        "SIGMAS"
+      ],
+      "output_is_list": [
+        false
+      ],
+      "output_name": [
+        "SIGMAS"
+      ],
+      "output_tooltips": [
+        null
+      ],
+      "output_matchtypes": null,
+      "name": "BasicScheduler",
+      "display_name": null,
+      "description": "",
+      "python_module": "comfy_extras.nodes_custom_sampler",
+      "category": "model/sampling/schedulers",
+      "output_node": false,
+      "deprecated": false,
+      "experimental": false,
+      "dev_only": false,
+      "api_node": false,
+      "price_badge": null,
+      "search_aliases": null,
+      "essentials_category": null,
+      "has_intermediate_output": false
+    },
+    "CLIPLoader": {
+      "input": {
+        "required": {
+          "clip_name": [
+            [
+              "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors"
+            ]
+          ],
+          "type": [
+            [
+              "stable_diffusion",
+              "stable_cascade",
+              "sd3",
+              "stable_audio",
+              "mochi",
+              "ltxv",
+              "pixart",
+              "cosmos",
+              "lumina2",
+              "wan",
+              "hidream",
+              "chroma",
+              "ace",
+              "omnigen2",
+              "qwen_image",
+              "hunyuan_image",
+              "flux2",
+              "ovis",
+              "longcat_image",
+              "cogvideox",
+              "lens",
+              "pixeldit",
+              "ideogram4",
+              "boogu",
+              "krea2",
+              "joyimage",
+              "mage",
+              "minimax",
+              "yue2",
+              "flux3",
+              "moss_image",
+              "fibo2"
+            ]
+          ]
+        },
+        "optional": {
+          "device": [
+            [
+              "default",
+              "cpu"
+            ],
+            {
+              "advanced": true
+            }
+          ]
+        }
+      },
+      "input_order": {
+        "required": [
+          "clip_name",
+          "type"
+        ],
+        "optional": [
+          "device"
+        ]
+      },
+      "output": [
+        "CLIP"
+      ],
+      "output_name": [
+        "CLIP"
+      ],
+      "name": "CLIPLoader",
+      "output_node": false
+    },
+    "CreateVideo": {
+      "input": {
+        "required": {
+          "images": [
+            "IMAGE",
+            {
+              "tooltip": "The images to create a video from."
+            }
+          ],
+          "fps": [
+            "FLOAT",
+            {
+              "default": 30.0,
+              "min": 1.0,
+              "max": 120.0,
+              "step": 1.0
+            }
+          ]
+        },
+        "optional": {
+          "audio": [
+            "AUDIO",
+            {
+              "tooltip": "The audio to add to the video."
+            }
+          ],
+          "bit_depth": [
+            "COMBO",
+            {
+              "tooltip": "Auto uses 8-bit for sRGB and 10-bit for HDR. Explicit 8-bit and 10-bit choices are independent of colorspace.",
+              "default": "auto",
+              "multiselect": false,
+              "options": [
+                "auto",
+                8,
+                10
+              ]
+            }
+          ],
+          "color_space": [
+            "COMBO",
+            {
+              "tooltip": "Colorspace of the input images. HDR selects BT.2020/HLG and HDR PQ selects BT.2020/PQ.",
+              "default": "sRGB",
+              "multiselect": false,
+              "options": [
+                "sRGB",
+                "HDR",
+                "HDR PQ"
+              ]
+            }
+          ],
+          "codec": [
+            "COMBO",
+            {
+              "tooltip": "Optionally encode the video immediately. None keeps the images in tensor form; Auto uses H.264.",
+              "advanced": true,
+              "default": "none",
+              "multiselect": false,
+              "options": [
+                "none",
+                "auto",
+                "h264",
+                "av1"
+              ]
+            }
+          ]
+        }
+      },
+      "input_order": {
+        "required": [
+          "images",
+          "fps"
+        ],
+        "optional": [
+          "audio",
+          "bit_depth",
+          "color_space",
+          "codec"
+        ]
+      },
+      "is_input_list": false,
+      "output": [
+        "VIDEO"
+      ],
+      "output_is_list": [
+        false
+      ],
+      "output_name": [
+        "VIDEO"
+      ],
+      "output_tooltips": [
+        null
+      ],
+      "output_matchtypes": null,
+      "name": "CreateVideo",
+      "display_name": "Create Video",
+      "description": "Create a video from images.",
+      "python_module": "comfy_extras.nodes_video",
+      "category": "video",
+      "output_node": false,
+      "deprecated": false,
+      "experimental": false,
+      "dev_only": false,
+      "api_node": false,
+      "price_badge": null,
+      "search_aliases": [
+        "images to video"
+      ],
+      "essentials_category": "Video Tools",
+      "has_intermediate_output": false
+    },
+    "H3RelayFiniteRun": {
+      "input": {
+        "required": {
+          "model": [
+            "MODEL"
+          ],
+          "clip": [
+            "CLIP"
+          ],
+          "vae": [
+            "VAE"
+          ],
+          "audio_vae": [
+            "VAE"
+          ],
+          "sampler": [
+            "SAMPLER"
+          ],
+          "sigmas": [
+            "SIGMAS"
+          ],
+          "prompt": [
+            "STRING",
+            {
+              "default": "",
+              "multiline": true
+            }
+          ],
+          "segments": [
+            "INT",
+            {
+              "default": 2,
+              "min": 1,
+              "max": 64,
+              "step": 1
+            }
+          ],
+          "seed": [
+            "INT",
+            {
+              "default": 0,
+              "min": 0,
+              "max": 18446744073709551615,
+              "step": 1,
+              "control_after_generate": true
+            }
+          ],
+          "run_id": [
+            "STRING",
+            {
+              "default": "relay"
+            }
+          ],
+          "width": [
+            "INT",
+            {
+              "default": 1344,
+              "min": 64,
+              "max": 8192,
+              "step": 16
+            }
+          ],
+          "height": [
+            "INT",
+            {
+              "default": 768,
+              "min": 64,
+              "max": 8192,
+              "step": 16
+            }
+          ],
+          "length": [
+            "INT",
+            {
+              "default": 124,
+              "min": 5,
+              "max": 3600,
+              "step": 17
+            }
+          ],
+          "context_frames": [
+            "INT",
+            {
+              "default": 22,
+              "min": 5,
+              "max": 124,
+              "step": 17
+            }
+          ],
+          "mask_mode": [
+            [
+              "hard",
+              "taper",
+              "ramp",
+              "blend",
+              "window"
+            ],
+            {
+              "default": "hard"
+            }
+          ],
+          "pin_audio": [
+            "BOOLEAN",
+            {
+              "default": true
+            }
+          ]
+        },
+        "optional": {
+          "image": [
+            "IMAGE"
+          ],
+          "ref_image_1": [
+            "IMAGE"
+          ],
+          "ref_image_2": [
+            "IMAGE"
+          ],
+          "ref_image_3": [
+            "IMAGE"
+          ],
+          "prompts": [
+            "STRING",
+            {
+              "default": "",
+              "multiline": true
+            }
+          ],
+          "voice_anchor": [
+            "LATENT"
+          ],
+          "note": [
+            "STRING",
+            {
+              "default": ""
+            }
+          ],
+          "settle_frames": [
+            "INT",
+            {
+              "default": 0,
+              "min": -1,
+              "max": 36,
+              "step": 1
+            }
+          ],
+          "from_segment": [
+            "INT",
+            {
+              "default": 0,
+              "min": 0,
+              "max": 9999,
+              "step": 1
+            }
+          ],
+          "ref_image_size": [
+            [
+              "match",
+              "max"
+            ],
+            {
+              "default": "match"
+            }
+          ],
+          "refs_mode": [
+            [
+              "lock",
+              "first_only"
+            ],
+            {
+              "default": "lock"
+            }
+          ],
+          "ref_anchor_mode": [
+            [
+              "off",
+              "first",
+              "roll"
+            ],
+            {
+              "default": "off"
+            }
+          ],
+          "ref_anchor_frames": [
+            "INT",
+            {
+              "default": 5,
+              "min": 1,
+              "max": 64,
+              "step": 1
+            }
+          ]
+        }
+      },
+      "input_order": {
+        "required": [
+          "model",
+          "clip",
+          "vae",
+          "audio_vae",
+          "sampler",
+          "sigmas",
+          "prompt",
+          "segments",
+          "seed",
+          "run_id",
+          "width",
+          "height",
+          "length",
+          "context_frames",
+          "mask_mode",
+          "pin_audio"
+        ],
+        "optional": [
+          "image",
+          "ref_image_1",
+          "ref_image_2",
+          "ref_image_3",
+          "prompts",
+          "voice_anchor",
+          "note",
+          "settle_frames",
+          "from_segment",
+          "ref_image_size",
+          "refs_mode",
+          "ref_anchor_mode",
+          "ref_anchor_frames"
+        ]
+      },
+      "output": [
+        "LATENT",
+        "IMAGE",
+        "AUDIO",
+        "STRING"
+      ],
+      "output_name": [
+        "last_latent",
+        "images",
+        "audio",
+        "report"
+      ],
+      "name": "H3RelayFiniteRun",
+      "output_node": false
+    },
+    "KSamplerSelect": {
+      "input": {
+        "required": {
+          "sampler_name": [
+            "COMBO",
+            {
+              "multiselect": false,
+              "options": [
+                "euler",
+                "euler_cfg_pp",
+                "euler_ancestral",
+                "euler_ancestral_cfg_pp",
+                "heun",
+                "heunpp2",
+                "exp_heun_2_x0",
+                "exp_heun_2_x0_sde",
+                "dpm_2",
+                "dpm_2_ancestral",
+                "lms",
+                "dpm_fast",
+                "dpm_adaptive",
+                "dpmpp_2s_ancestral",
+                "dpmpp_2s_ancestral_cfg_pp",
+                "dpmpp_sde",
+                "dpmpp_sde_gpu",
+                "dpmpp_2m",
+                "dpmpp_2m_cfg_pp",
+                "dpmpp_2m_sde",
+                "dpmpp_2m_sde_gpu",
+                "dpmpp_2m_sde_heun",
+                "dpmpp_2m_sde_heun_gpu",
+                "dpmpp_3m_sde",
+                "dpmpp_3m_sde_gpu",
+                "ddpm",
+                "lcm",
+                "ipndm",
+                "ipndm_v",
+                "deis",
+                "cfgpp_ud10_ab",
+                "res_multistep",
+                "res_multistep_cfg_pp",
+                "res_multistep_ancestral",
+                "res_multistep_ancestral_cfg_pp",
+                "gradient_estimation",
+                "gradient_estimation_cfg_pp",
+                "er_sde",
+                "seeds_2",
+                "seeds_3",
+                "sa_solver",
+                "sa_solver_pece",
+                "ddim",
+                "uni_pc",
+                "uni_pc_bh2"
+              ]
+            }
+          ]
+        }
+      },
+      "input_order": {
+        "required": [
+          "sampler_name"
+        ]
+      },
+      "is_input_list": false,
+      "output": [
+        "SAMPLER"
+      ],
+      "output_is_list": [
+        false
+      ],
+      "output_name": [
+        "SAMPLER"
+      ],
+      "output_tooltips": [
+        null
+      ],
+      "output_matchtypes": null,
+      "name": "KSamplerSelect",
+      "display_name": null,
+      "description": "",
+      "python_module": "comfy_extras.nodes_custom_sampler",
+      "category": "model/sampling/samplers",
+      "output_node": false,
+      "deprecated": false,
+      "experimental": false,
+      "dev_only": false,
+      "api_node": false,
+      "price_badge": null,
+      "search_aliases": null,
+      "essentials_category": null,
+      "has_intermediate_output": false
+    },
+    "LoadImage": {
+      "input": {
+        "required": {
+          "image": [
+            [
+              "input_ref_1.jpg",
+              "input_ref_2.jpg",
+              "input_ref_3.jpg",
+              "input_ref_4.jpg",
+              "input_ref_5.jpg",
+              "input_ref_6.jpg"
+            ]
+          ]
+        }
+      },
+      "input_order": {
+        "required": [
+          "image"
+        ]
+      },
+      "output": [
+        "IMAGE",
+        "MASK"
+      ],
+      "output_name": [
+        "IMAGE",
+        "MASK"
+      ],
+      "name": "LoadImage",
+      "output_node": false
+    },
+    "LoraLoaderModelOnly": {
+      "input": {
+        "required": {
+          "model": [
+            "MODEL"
+          ],
+          "lora_name": [
+            [
+              "minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors",
+              "minimax_h3_ref2v_turbo_8step_v1.1_768p_comfyui_bf16.safetensors"
+            ]
+          ],
+          "strength_model": [
+            "FLOAT",
+            {
+              "default": 1.0,
+              "min": -100.0,
+              "max": 100.0,
+              "step": 0.01
+            }
+          ]
+        }
+      },
+      "input_order": {
+        "required": [
+          "model",
+          "lora_name",
+          "strength_model"
+        ]
+      },
+      "output": [
+        "MODEL"
+      ],
+      "output_name": [
+        "MODEL"
+      ],
+      "name": "LoraLoaderModelOnly",
+      "output_node": false
+    },
+    "MiniMaxH3SigmaShift": {
+      "input": {
+        "required": {
+          "model": [
+            "MODEL",
+            {}
+          ],
+          "shift_video": [
+            "FLOAT",
+            {
+              "default": 12.0,
+              "min": 0.01,
+              "max": 100.0,
+              "step": 0.01
+            }
+          ],
+          "shift_audio": [
+            "FLOAT",
+            {
+              "default": 3.0,
+              "min": 0.01,
+              "max": 100.0,
+              "step": 0.01
+            }
+          ]
+        }
+      },
+      "input_order": {
+        "required": [
+          "model",
+          "shift_video",
+          "shift_audio"
+        ]
+      },
+      "is_input_list": false,
+      "output": [
+        "MODEL"
+      ],
+      "output_is_list": [
+        false
+      ],
+      "output_name": [
+        "MODEL"
+      ],
+      "output_tooltips": [
+        null
+      ],
+      "output_matchtypes": null,
+      "name": "MiniMaxH3SigmaShift",
+      "display_name": "ModelSamplingMiniMaxH3",
+      "description": "Set the video/audio flow shifts.",
+      "python_module": "comfy_extras.nodes_minimax_h3",
+      "category": "model/patch/minimax",
+      "output_node": false,
+      "deprecated": false,
+      "experimental": false,
+      "dev_only": false,
+      "api_node": false,
+      "price_badge": null,
+      "search_aliases": [
+        "sigma shift",
+        "minimax shift"
+      ],
+      "essentials_category": null,
+      "has_intermediate_output": false
+    },
+    "SaveVideo": {
+      "input": {
+        "required": {
+          "video": [
+            "VIDEO",
+            {
+              "tooltip": "The video to save."
+            }
+          ],
+          "filename_prefix": [
+            "STRING",
+            {
+              "tooltip": "The prefix for the file to save. This may include formatting information such as %date:yyyy-MM-dd% or %Empty Latent Image.width% to include values from nodes.",
+              "default": "video/ComfyUI",
+              "multiline": false
+            }
+          ],
+          "format": [
+            [
+              "auto"
+            ],
+            {}
+          ]
+        },
+        "optional": {
+          "format.codec": [
+            [
+              "auto"
+            ],
+            {}
+          ]
+        },
+        "hidden": {
+          "prompt": [
+            "PROMPT"
+          ],
+          "extra_pnginfo": [
+            "EXTRA_PNGINFO"
+          ]
+        }
+      },
+      "input_order": {
+        "required": [
+          "video",
+          "filename_prefix",
+          "format"
+        ],
+        "optional": [
+          "codec"
+        ],
+        "hidden": [
+          "prompt",
+          "extra_pnginfo"
+        ]
+      },
+      "is_input_list": false,
+      "output": [
+        "VIDEO"
+      ],
+      "output_is_list": [
+        false
+      ],
+      "output_name": [
+        "video"
+      ],
+      "output_tooltips": [
+        "The input video, unchanged."
+      ],
+      "output_matchtypes": null,
+      "name": "SaveVideo",
+      "display_name": "Save Video",
+      "description": "Saves the input videos to your ComfyUI output directory.",
+      "python_module": "comfy_extras.nodes_video",
+      "category": "video",
+      "output_node": true,
+      "deprecated": false,
+      "experimental": false,
+      "dev_only": false,
+      "api_node": false,
+      "price_badge": null,
+      "search_aliases": [
+        "export video"
+      ],
+      "essentials_category": "Basics",
+      "has_intermediate_output": false
+    },
+    "UNETLoader": {
+      "input": {
+        "required": {
+          "unet_name": [
+            [
+              "minimax_h3_ref2va_pruned_int8_convrot.safetensors"
+            ]
+          ],
+          "weight_dtype": [
+            [
+              "default",
+              "fp8_e4m3fn",
+              "fp8_e4m3fn_fast",
+              "fp8_e5m2"
+            ],
+            {
+              "advanced": true
+            }
+          ]
+        }
+      },
+      "input_order": {
+        "required": [
+          "unet_name",
+          "weight_dtype"
+        ]
+      },
+      "output": [
+        "MODEL"
+      ],
+      "output_name": [
+        "MODEL"
+      ],
+      "name": "UNETLoader",
+      "output_node": false
+    },
+    "VAELoader": {
+      "input": {
+        "required": {
+          "vae_name": [
+            [
+              "minimax_h3_video_vae_int8_convrot.safetensors",
+              "minimax_h3_video_vae_dully_seamless_v1_int8convrot.safetensors",
+              "minimax_h3_audio_vae_fp32.safetensors"
+            ]
+          ]
+        }
+      },
+      "input_order": {
+        "required": [
+          "vae_name"
+        ]
+      },
+      "output": [
+        "VAE"
+      ],
+      "output_name": [
+        "VAE"
+      ],
+      "name": "VAELoader",
+      "output_node": false
+    }
+  }
+}
