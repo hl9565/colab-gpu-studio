@@ -1,0 +1,41 @@
+name: Plugin and Backend Tests
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  plugin-and-python-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Run Video Canvas plugin zero-GPU contract tests
+        run: node tests/test_video_canvas_plugin.mjs
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install package and test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[test]"
+
+      - name: Lint Python changes
+        run: ruff check api tests
+
+      - name: Run offline pytest suite (including Video Canvas binding integration)
+        run: pytest tests/test_video_canvas_integration.py tests/test_builtin_workflows.py tests/test_standalone_release.py tests/test_compute_specs_offline.py

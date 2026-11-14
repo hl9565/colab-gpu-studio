@@ -4,6 +4,12 @@ on:
   push:
     branches:
       - main
+    paths-ignore:
+      - ".github/**"
+      - "integrations/**"
+      - "tests/**"
+      - "docs/**"
+      - "*.md"
     tags:
       - 'v*'
   workflow_dispatch:
