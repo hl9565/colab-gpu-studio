@@ -146,6 +146,18 @@ function testDurationsAndDimensions() {
   assert.equal(fhd.submit.json.params.width, 544);
   assert.equal(fhd.submit.json.params.height, 960);
   assert.equal(fhd.submit.json.params.length, 243);
+
+  const fhdLandscape = runPipeline({
+    input: {
+      prompt: "1080P 横屏",
+      images: ["fileRef://img-1"],
+      aspect_ratio: "16:9",
+      resolution: "1080P",
+      duration: 5,
+    },
+  });
+  assert.equal(fhdLandscape.submit.json.params.width, 960);
+  assert.equal(fhdLandscape.submit.json.params.height, 544);
 }
 
 function testRefAndI2VAndTwoPhaseDownload() {

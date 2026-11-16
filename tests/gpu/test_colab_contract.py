@@ -2,52 +2,19 @@ from __future__ import annotations
 
 import httpx
 import pytest
+from app.db import Store
 from app.gpu.colab import ColabError, GoogleColabProvider
+from app.gpu.repository import Repository
 from app.security import encrypt_secret
 
 
-class MemoryRepository:
+class MemoryRepository(Repository):
     def __init__(self):
-        self.rows = {"credentials": [], "leases": []}
-        self.create(
-            "credentials",
-            "owner-1",
-            {
-                "provider": "google",
-                "purpose": "colab",
-                "encrypted_access_token": encrypt_secret("access"),
-                "encrypted_refresh_token": encrypt_secret("refresh"),
-                "expires_at": 9999999999,
-            },
-        )
-
-    def create(self, kind, owner_id, data, **kwargs):
-        row = {"id": f"{kind}-{len(self.rows.setdefault(kind, [])) + 1}", "owner_id": owner_id, **data}
-        self.rows[kind].append(row)
-        return dict(row)
-
-    def get(self, kind, record_id, owner_id=None):
-        return next(
-            (
-                dict(r)
-                for r in self.rows.get(kind, [])
-                if r["id"] == record_id and (owner_id is None or r["owner_id"] == owner_id)
-            ),
-            None,
-        )
-
-    def list(self, kind, owner_id=None, **kwargs):
-        return [dict(r) for r in self.rows.get(kind, []) if owner_id is None or r["owner_id"] == owner_id]
-
-    def update(self, kind, record_id, patch, owner_id=None):
-        row = self.get(kind, record_id, owner_id)
-        if row is None:
-            raise KeyError(record_id)
-        for current in self.rows[kind]:
-            if current["id"] == record_id:
-                current.update(patch)
-                return dict(current)
-        raise KeyError(record_id)
+        super().__init__(Store("sqlite:///:memory:"))
+        self.create("credentials", "owner-1", {
+            "provider": "google", "purpose": "colab", "encrypted_access_token": encrypt_secret("access"),
+            "encrypted_refresh_token": encrypt_secret("refresh"), "expires_at": 9999999999,
+        })
 
 
 def make(handler):
@@ -207,3 +174,92 @@ def test_delete_requires_owner_and_get_404_confirmation():
     assert paths == [("GET", "/v1beta/runtimes/atelier-runtime-1")]
     with pytest.raises(Exception, match="归属"):
         provider.delete({"runtime_name": "runtimes/other", "runtime_id": "other", "owner_id": "other-owner"})
+
+
+def test_3xx_redirect_rejected_fail_closed_in_rest_and_tunnel():
+    def rest_handler(request):
+        return httpx.Response(302, headers={"Location": "https://accounts.google.com/login"}, json={"runtimeSpecs": []})
+
+    with pytest.raises(ColabError):
+        make(rest_handler).list_specs()
+
+    repo = MemoryRepository()
+    repo.create(
+        "leases",
+        "owner-1",
+        {
+            "provider": "colab",
+            "state": "active",
+            "owner_job_id": "job-1",
+            "request_id": "11111111-1111-4111-8111-111111111111",
+            "runtime_id": "studio-ep-1",
+            "tunnel_endpoint": "ep-1",
+        },
+    )
+
+    def tunnel_handler(request):
+        return httpx.Response(302, headers={"Location": "https://accounts.google.com/login"}, text=")]}'\n{\"assignments\": []}")
+
+    provider = GoogleColabProvider(
+        repo,
+        "owner-1",
+        client=httpx.Client(transport=httpx.MockTransport(tunnel_handler)),
+    )
+    status = provider.inspect(
+        {
+            "owner_id": "owner-1",
+            "owner_job_id": "job-1",
+            "job_id": "job-1",
+            "request_id": "11111111-1111-4111-8111-111111111111",
+            "runtime_id": "studio-ep-1",
+            "runtime_name": "runtimes/studio-ep-1",
+        }
+    )
+    assert status["deleted"] is False
+    assert status["allocation_unknown"] is True
+    assert status["remote_verified"] is False
+
+
+def test_cli_tunnel_unassign_404_verifies_assignment_presence():
+    assignments_state = {"items": [{"endpoint": "ep-1"}]}
+    repo = MemoryRepository()
+    repo.create(
+        "leases",
+        "owner-1",
+        {
+            "provider": "colab",
+            "state": "active",
+            "owner_job_id": "job-1",
+            "request_id": "11111111-1111-4111-8111-111111111111",
+            "runtime_id": "studio-ep-1",
+            "tunnel_endpoint": "ep-1",
+        },
+    )
+
+    def handler(request):
+        if request.url.path == "/tun/m/unassign/ep-1" and request.method == "GET":
+            return httpx.Response(200, text=")]}'\n{\"token\": \"xsrf-1\"}")
+        if request.url.path == "/tun/m/unassign/ep-1" and request.method == "POST":
+            return httpx.Response(404, text="{}")
+        if request.url.path == "/tun/m/assignments":
+            import json
+
+            return httpx.Response(200, text=")]}'\n" + json.dumps({"assignments": assignments_state["items"]}))
+        raise AssertionError(f"unexpected {request.method} {request.url}")
+
+    provider = GoogleColabProvider(
+        repo,
+        "owner-1",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    handle = {
+        "owner_id": "owner-1",
+        "owner_job_id": "job-1",
+        "job_id": "job-1",
+        "request_id": "11111111-1111-4111-8111-111111111111",
+        "runtime_id": "studio-ep-1",
+        "runtime_name": "runtimes/studio-ep-1",
+    }
+    assert provider.delete(handle) is False
+    assignments_state["items"] = []
+    assert provider.delete(handle) is True

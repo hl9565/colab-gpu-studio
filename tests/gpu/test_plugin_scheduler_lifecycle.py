@@ -5,6 +5,7 @@ from app.gpu.compute import MockColabProvider, MockGPUExecutor
 from app.gpu.newgpu.executor_plugins import TrustedExecutorAdapter
 from app.gpu.repository import Repository
 from app.gpu.scheduler import Scheduler
+from test_pr4_signoff_regressions import seed_execution_binding
 
 
 class FakeTrustedPluginExecutor(TrustedExecutorAdapter):
@@ -175,6 +176,8 @@ def test_trusted_plugin_start_and_poll_receive_lease_deadline_in_memory():
         record_id="deadline-lease",
     )
     job = repo.update("jobs", job["id"], {"lease_id": lease["id"]}, "owner-1")
+    job = repo.prepare_execution(job["id"], "owner-1", lease["id"], 1000.0)
+    job = seed_execution_binding(repo, job, lease)
     executor = FakeTrustedPluginExecutor()
     scheduler = scheduler_for(repo, executor, MockColabProvider())
 

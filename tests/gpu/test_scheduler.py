@@ -275,8 +275,9 @@ def test_real_sqlite_rejects_unverified_runtime_spec_before_create(tmp_path):
 
 
 def test_real_sqlite_unknown_create_is_inspected_and_deleted(tmp_path):
-    class TimeoutProvider(SpecProvider):
+    class TimeoutHealthyProvider(SpecProvider):
         def create(self, spec, request_id, job_id, runtime_id):
+            self.create_calls += 1
             self._runtimes[f"mock-runtime-{runtime_id}"] = {
                 "runtime_name": f"mock-runtime-{runtime_id}",
                 "runtime_id": runtime_id,
@@ -287,18 +288,49 @@ def test_real_sqlite_unknown_create_is_inspected_and_deleted(tmp_path):
             raise TimeoutError("provider timed out after allocation")
 
     base, repo, job = sqlite_job(tmp_path)
-    provider = TimeoutProvider([{"name": "mock-colab", "eligible": True, "gpu": True, "vram_gb": 16}])
+    provider = TimeoutHealthyProvider([{"name": "mock-colab", "eligible": True, "gpu": True, "vram_gb": 16}])
     scheduler = Scheduler(
         base,
         provider_factory=lambda j, s: provider,
         executor_factory=lambda j, s: MockGPUExecutor(),
         config=GpuConfig(create_retries=0),
     )
+    # Drive until leaving allocating -> preparing first to verify P0-1 avoids delete during recovery.
+    for _ in range(10):
+        scheduler.tick()
+        cur = repo.get("jobs", job["id"], "u1")
+        if cur["state"] not in {"queued", "validating", "waiting_for_capacity", "allocating"}:
+            break
+    assert cur["state"] == "preparing"
+    assert provider.inspect_calls >= 1
+    assert provider.create_calls == 1 and provider.delete_calls == 0
+
     result = drive(scheduler, job["id"])
     lease = repo.list("leases", "u1")[0]
-    assert result["state"] == "failed"
-    assert provider.inspect_calls >= 1 and provider.delete_calls >= 1
+    assert result["state"] == "completed"
+    assert provider.create_calls == 1
     assert lease["state"] == "deleted"
+
+    class TimeoutFailedAllocProvider(TimeoutHealthyProvider):
+        def inspect(self, handle):
+            self.inspect_calls += 1
+            return {"ready": False, "allocation_failed": True, "error": "backend failed", "deleted": False}
+
+    base2 = Store(f"sqlite:///{tmp_path / 'gpu_failed_alloc.db'}")
+    repo2 = Repository(base2)
+    job2 = make_job(repo2)
+    provider2 = TimeoutFailedAllocProvider([{"name": "mock-colab", "eligible": True, "gpu": True, "vram_gb": 16}])
+    scheduler2 = Scheduler(
+        base2,
+        provider_factory=lambda j, s: provider2,
+        executor_factory=lambda j, s: MockGPUExecutor(),
+        config=GpuConfig(create_retries=0),
+    )
+    result2 = drive(scheduler2, job2["id"])
+    lease2 = repo2.list("leases", "u1")[0]
+    assert result2["state"] == "failed"
+    assert provider2.inspect_calls >= 1 and provider2.delete_calls >= 1
+    assert lease2["state"] == "deleted"
 
 
 def test_real_sqlite_orphan_watchdog_only_cleans_expired_owned_lease(tmp_path):

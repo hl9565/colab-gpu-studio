@@ -49,6 +49,7 @@ def job(owner="owner-1", job_id="job-1", provider="mock", **extra):
         "owner_id": owner,
         "project_id": "project-1",
         "provider": provider,
+        "state": "waiting_for_capacity",
         "execution_policy": {"provider": provider},
         "compatibility_signature": "compat-v1",
         "attempt_number": 1,
@@ -56,6 +57,14 @@ def job(owner="owner-1", job_id="job-1", provider="mock", **extra):
         **extra,
     }
     return data
+
+
+def ensure_job(repo, owner="owner-1", job_id="job-1", provider="mock", **extra):
+    existing = repo.get("jobs", job_id, owner)
+    if existing is not None:
+        return existing
+    payload = job(owner=owner, job_id=job_id, provider=provider, **extra)
+    return repo.create("jobs", owner, payload, record_id=job_id)
 
 
 def account(repo, account_id="acct-1", **extra):
@@ -77,9 +86,10 @@ def account(repo, account_id="acct-1", **extra):
 
 def test_mock_allocate_is_stable_across_restart_and_creates_default_account(repo):
     first = InstanceService(repo, clock=lambda: 100.0)
-    allocated = first.allocate(job())
+    j = ensure_job(repo)
+    allocated = first.allocate(j)
     restarted = InstanceService(repo, clock=lambda: 101.0)
-    duplicate = restarted.allocate(job())
+    duplicate = restarted.allocate(j)
 
     assert allocated["id"] == duplicate["id"]
     assert allocated["account_id"].startswith("mock-")
@@ -102,6 +112,7 @@ def test_concurrent_jobs_cannot_claim_same_instance(repo):
         },
         record_id="instance-idle",
     )
+    jobs = [ensure_job(repo, job_id=f"job-{i}") for i in range(2)]
     barrier = threading.Barrier(2)
     results = []
 
@@ -110,10 +121,10 @@ def test_concurrent_jobs_cannot_claim_same_instance(repo):
             barrier.wait()
             return super().allocate(value)
 
-    def run(job_id):
-        results.append(WaitingService(repo, clock=lambda: 100.0).allocate(job(job_id=job_id)))
+    def run(job_row):
+        results.append(WaitingService(repo, clock=lambda: 100.0).allocate(job_row))
 
-    threads = [threading.Thread(target=run, args=(f"job-{i}",)) for i in range(2)]
+    threads = [threading.Thread(target=run, args=(j,)) for j in jobs]
     for thread in threads:
         thread.start()
     for thread in threads:
@@ -128,13 +139,13 @@ def test_unknown_or_requested_instance_never_falls_back(repo):
     account(repo)
     service = InstanceService(repo, clock=lambda: 100.0)
     with pytest.raises(AllocationError):
-        service.allocate(job(requested_instance_id="does-not-exist"))
+        service.allocate(ensure_job(repo, requested_instance_id="does-not-exist"))
     assert repo.list("instances", "owner-1") == []
 
 
 def test_retention_is_idempotent_and_stop_wins(repo):
     service = InstanceService(repo, clock=lambda: 100.0, config={"max_idle_minutes": 30})
-    instance = service.allocate(job(lifecycle="retain"))
+    instance = service.allocate(ensure_job(repo, lifecycle="retain"))
     first = service.retention("owner-1", instance["id"], "retain", 10, "retain-key")
     again = service.retention("owner-1", instance["id"], "retain", 10, "retain-key")
     assert first == again
@@ -149,7 +160,7 @@ def test_retention_is_idempotent_and_stop_wins(repo):
 
 def test_retention_never_extends_hard_deadline_and_usage_replay_is_free(repo):
     service = InstanceService(repo, clock=lambda: 100.0, config={"max_idle_minutes": 60})
-    instance = service.allocate(job(lifecycle="retain", hard_deadline_at=350.0))
+    instance = service.allocate(ensure_job(repo, lifecycle="retain", hard_deadline_at=350.0))
     retained = service.retention("owner-1", instance["id"], "smart", 60, "smart-key")
     assert retained["idle_deadline_at"] == 350.0
     assert retained["hard_deadline_at"] == 350.0
@@ -173,13 +184,14 @@ def test_retention_never_extends_hard_deadline_and_usage_replay_is_free(repo):
 def test_real_allocation_requires_explicit_rate_and_project_allowlist(repo):
     account(repo, provider="colab", allowed_projects=["project-1"])
     service = InstanceService(repo, clock=lambda: 100.0, config={"unit_rate": None})
+    j = ensure_job(repo, provider="colab", execution_policy={"provider": "colab"})
     with pytest.raises(BudgetError):
-        service.allocate(job(provider="colab", execution_policy={"provider": "colab"}))
+        service.allocate(j)
 
     service = InstanceService(repo, clock=lambda: 100.0, config={"unit_rate": 0.1})
     repo.update("accounts", "acct-1", {"allowed_projects": ["other-project"]}, "owner-1")
     with pytest.raises(AllocationError):
-        service.allocate(job(provider="colab", execution_policy={"provider": "colab"}))
+        service.allocate(j)
 
 
 @pytest.mark.parametrize("rate", [0, -1, float("nan"), float("inf")])
@@ -187,7 +199,7 @@ def test_real_budget_rate_must_be_finite_and_positive(repo, rate):
     account(repo, provider="colab", allowed_projects=["project-1"])
     with pytest.raises(BudgetError):
         InstanceService(repo, clock=lambda: 100.0, config={"unit_rate": rate}).allocate(
-            job(provider="colab", execution_policy={"provider": "colab"}, max_runtime_minutes=5)
+            ensure_job(repo, provider="colab", execution_policy={"provider": "colab"}, max_runtime_minutes=5)
         )
 
 
@@ -210,7 +222,7 @@ def test_real_budget_is_account_and_global_safe_and_missing_signature_does_not_r
     )
     with pytest.raises(BudgetError):
         InstanceService(repo, clock=lambda: 100.0, config={"unit_rate": 0.1, "daily_units": 5.0}).allocate(
-            job(provider="colab", budget_units=1.0, execution_policy={"provider": "colab"})
+            ensure_job(repo, provider="colab", budget_units=1.0, execution_policy={"provider": "colab"})
         )
 
     idle = repo.create(
@@ -219,7 +231,7 @@ def test_real_budget_is_account_and_global_safe_and_missing_signature_does_not_r
         record_id="missing-signature",
     )
     result = InstanceService(repo, clock=lambda: 100.0, config={"unit_rate": 0.1, "daily_units": 20.0}).allocate(
-        job(provider="colab", job_id="job-new", budget_units=1.0, execution_policy={"provider": "colab"})
+        ensure_job(repo, provider="colab", job_id="job-new", budget_units=1.0, execution_policy={"provider": "colab"})
     )
     assert result["id"] != idle["id"]
 
@@ -247,7 +259,8 @@ def test_real_global_budget_sums_reservations_across_accounts(repo):
     )
     with pytest.raises(BudgetError):
         service.allocate(
-            job(
+            ensure_job(
+                repo,
                 provider="colab",
                 requested_account_id="acct-1",
                 budget_units=2.1,
@@ -265,7 +278,8 @@ def test_real_allocation_rejects_account_without_nested_budget(repo):
     )
     with pytest.raises(BudgetError):
         service.allocate(
-            job(
+            ensure_job(
+                repo,
                 provider="colab",
                 requested_account_id="acct-1",
                 budget_units=1.0,
@@ -282,7 +296,8 @@ def test_real_retention_reserves_idle_fee_against_budget(repo):
         config={"unit_rate": 0.1, "daily_units": 100.0, "monthly_units": 100.0, "max_idle_minutes": 30},
     )
     instance = service.allocate(
-        job(
+        ensure_job(
+            repo,
             provider="colab",
             requested_account_id="acct-1",
             budget_units=1.0,
@@ -299,7 +314,7 @@ def test_real_retention_reserves_idle_fee_against_budget(repo):
 
 def test_usage_reports_request_to_confirmed_deletion_duration(repo):
     service = InstanceService(repo, clock=lambda: 100.0)
-    instance = service.allocate(job())
+    instance = service.allocate(ensure_job(repo))
     usage = service.record_usage(
         "owner-1",
         {
@@ -319,7 +334,7 @@ def test_usage_reports_request_to_confirmed_deletion_duration(repo):
 
 def test_public_and_events_never_expose_handles_or_tokens(repo):
     service = InstanceService(repo, clock=lambda: 100.0)
-    instance = service.allocate(job(handle={"runtime_name": "secret", "token": "secret"}))
+    instance = service.allocate(ensure_job(repo, handle={"runtime_name": "secret", "token": "secret"}))
     public = service.public(instance)
     assert "handle" not in public and "token" not in public
     assert "runtime_name" not in public
@@ -328,10 +343,11 @@ def test_public_and_events_never_expose_handles_or_tokens(repo):
 
 def test_instance_retention_override_is_authoritative_and_deletion_requires_confirmation(repo):
     service = InstanceService(repo, clock=lambda: 100.0, config={"max_idle_minutes": 30})
-    instance = service.allocate(job(lifecycle="save"))
+    j = ensure_job(repo, lifecycle="save")
+    instance = service.allocate(j)
     retained = service.retention("owner-1", instance["id"], "retain", 10, "keep-key")
     assert retained["retention_mode"] == "retain"
-    completed = service.complete(job(lifecycle="save"))
+    completed = service.complete(j)
     assert completed["state"] == "retained_idle"
 
     service.stop("owner-1", instance["id"], "stop-key")
@@ -343,7 +359,7 @@ def test_instance_retention_override_is_authoritative_and_deletion_requires_conf
 
 def test_remote_confirmed_deletion_can_close_retained_idle_instance(repo):
     service = InstanceService(repo, clock=lambda: 100.0, config={"max_idle_minutes": 30})
-    instance = service.allocate(job(lifecycle="retain"))
+    instance = service.allocate(ensure_job(repo, lifecycle="retain"))
     retained = service.retention("owner-1", instance["id"], "retain", 10, "retained-delete-key")
     assert retained["state"] == "retained_idle"
     deleted = service.mark_deleted("owner-1", instance["id"], remote_deleted=True)
@@ -353,9 +369,10 @@ def test_remote_confirmed_deletion_can_close_retained_idle_instance(repo):
 
 def test_bind_lease_persists_instance_and_lease_account_identity_without_fallback(repo):
     service = InstanceService(repo, clock=lambda: 100.0)
-    instance = service.allocate(job())
-    lease = repo.create("leases", "owner-1", {"state": "active"}, record_id="lease-1")
-    bound = service.bind_lease({**job(), "instance_id": instance["id"]}, {**lease, "deadline_epoch": 500.0})
+    j = ensure_job(repo)
+    instance = service.allocate(j)
+    lease = repo.create("leases", "owner-1", {"state": "active", "owner_job_id": "job-1"}, record_id="lease-1")
+    bound = service.bind_lease({**j, "instance_id": instance["id"]}, {**lease, "deadline_epoch": 500.0})
     assert bound["lease_id"] == "lease-1"
     saved_lease = repo.get("leases", "lease-1", "owner-1")
     assert saved_lease["instance_id"] == instance["id"]
@@ -364,7 +381,7 @@ def test_bind_lease_persists_instance_and_lease_account_identity_without_fallbac
 
 def test_mock_allocates_with_unconnected_google_directory(repo):
     account(repo, connected=False, auth_status="not_connected", enabled=False)
-    instance = InstanceService(repo).allocate(job())
+    instance = InstanceService(repo).allocate(ensure_job(repo))
     assert instance["provider"] == "mock"
     assert instance["account_id"].startswith("mock-")
 
@@ -379,14 +396,14 @@ def test_account_project_directory_empty_means_unrestricted(repo, projects, allo
 def test_retained_instance_refreshes_idle_deadline_on_subsequent_job_completion(repo):
     now = [100.0]
     service = InstanceService(repo, clock=lambda: now[0], config={"max_idle_minutes": 30})
-    j1 = job(job_id="job-1", lifecycle="retain", execution_policy={"provider": "mock", "lifecycle": "retain", "retain_idle_minutes": 30})
+    j1 = ensure_job(repo, job_id="job-1", lifecycle="retain", execution_policy={"provider": "mock", "lifecycle": "retain", "retain_idle_minutes": 30})
     instance = service.allocate(j1)
     first_done = service.complete(j1, success=True)
     assert first_done["state"] == "retained_idle"
     assert first_done["idle_deadline_at"] == 100.0 + 30 * 60
 
     now[0] = 1850.0
-    j2 = job(job_id="job-2", requested_instance_id=instance["id"], lifecycle="retain", execution_policy={"provider": "mock", "lifecycle": "retain", "retain_idle_minutes": 30})
+    j2 = ensure_job(repo, job_id="job-2", requested_instance_id=instance["id"], lifecycle="retain", execution_policy={"provider": "mock", "lifecycle": "retain", "retain_idle_minutes": 30})
     reused = service.allocate(j2)
     assert reused["id"] == instance["id"]
     assert reused["idle_deadline_at"] is None

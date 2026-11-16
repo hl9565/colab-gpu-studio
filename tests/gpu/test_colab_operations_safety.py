@@ -3,7 +3,9 @@ import uuid
 
 import httpx
 import pytest
+from app.db import Store
 from app.gpu.colab import ColabError, GoogleColabProvider
+from app.gpu.repository import Repository
 
 
 class Google:
@@ -11,26 +13,15 @@ class Google:
         return "never-return-this-token"
 
 
-class Repo:
+class Repo(Repository):
     def __init__(self):
-        self.rows = [
-            {
-                "id": "lease",
-                "owner_id": "owner",
-                "owner_job_id": "job",
-                "runtime_id": "studio-test",
-                "request_id": str(uuid.uuid4()),
-                "state": "creating",
-            }
-        ]
+        super().__init__(Store("sqlite:///:memory:"))
+        self.create("leases", "owner", {"owner_job_id": "job", "runtime_id": "studio-test",
+            "request_id": str(uuid.uuid4()), "state": "creating"}, record_id="lease")
 
-    def list(self, kind, owner_id=None):
-        return [dict(r) for r in self.rows if owner_id is None or r["owner_id"] == owner_id]
-
-    def update(self, kind, rid, patch, owner_id=None):
-        row = next(r for r in self.rows if r["id"] == rid)
-        row.update(patch)
-        return dict(row)
+    @property
+    def rows(self):
+        return self.list("leases", "owner")
 
 
 def provider(handler):

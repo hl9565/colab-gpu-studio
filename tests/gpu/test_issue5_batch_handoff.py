@@ -108,6 +108,7 @@ def test_handoff_does_not_mutate_foreign_execution():
     first, following = sorted(repo.list("jobs", "owner"), key=lambda row: row["queue_order"])
     instance = repo.create("instances", "owner", {"account_id": "acct", "state": "busy", "current_job_id": first["id"]})
     lease = repo.create("leases", "owner", {"state": "active", "owner_job_id": first["id"], "instance_id": instance["id"], "account_id": "acct", "deadline_epoch": 9999, "handle": {"job_id": first["id"], "owner_job_id": first["id"]}})
+    repo.update("instances", instance["id"], {"lease_id": lease["id"]}, "owner")
     foreign = repo.create("executions", "other-owner", {"state": "running", "job_id": "unrelated"})
     repo.update("jobs", first["id"], {"state": "cleaning_up", "execution_id": foreign["id"], "instance_id": instance["id"], "lease_id": lease["id"], "compatibility_signature": "same"}, "owner")
     repo.update("jobs", following["id"], {"state": "waiting_for_capacity", "compatibility_signature": "same"}, "owner")
@@ -240,6 +241,7 @@ def test_sql_cleanup_claim_ttl_replaces_crashed_claim_and_fences_old_token():
     repo = Repository(Store("sqlite:///:memory:"))
     instance = repo.create("instances", "owner", {"state": "releasing", "account_id": "acct"}, record_id="instance")
     lease = repo.create("leases", "owner", {"state": "cleanup_pending", "owner_job_id": "old", "instance_id": instance["id"], "account_id": "acct", "request_id": "req", "runtime_id": "runtime", "handle": {"runtime_id": "runtime", "job_id": "old", "owner_job_id": "old"}}, record_id="lease")
+    repo.update("instances", instance["id"], {"lease_id": lease["id"]}, "owner")
     first = repo.claim_orphan_lease("owner", lease["id"], instance["id"], "token-a", 100.0)
     assert first is not None
     assert repo.claim_orphan_lease("owner", lease["id"], instance["id"], "token-b", 101.0) is None
@@ -254,6 +256,7 @@ def test_sql_cleanup_claim_fences_allocation_and_bind_until_finished():
     repo = Repository(Store("sqlite:///:memory:"))
     instance = repo.create("instances", "owner", {"state": "releasing", "account_id": "acct"}, record_id="instance")
     lease = repo.create("leases", "owner", {"state": "cleanup_pending", "owner_job_id": "old", "instance_id": instance["id"], "account_id": "acct", "request_id": "req", "runtime_id": "runtime", "handle": {"runtime_id": "runtime", "job_id": "old", "owner_job_id": "old"}}, record_id="lease")
+    repo.update("instances", instance["id"], {"lease_id": lease["id"]}, "owner")
     assert repo.claim_orphan_lease("owner", lease["id"], instance["id"], "token", 100.0)
     service = InstanceService(repo, clock=lambda: 100.0)
     body = {"id": "new-job", "owner_id": "owner", "project_id": "p", "provider": "mock", "requested_instance_id": instance["id"]}
@@ -285,6 +288,7 @@ def test_handoff_rejects_existing_successor_execution_association_conflict():
     first, following = sorted(repo.list("jobs", "owner"), key=lambda row: row["queue_order"])
     instance = repo.create("instances", "owner", {"account_id": "acct", "state": "busy", "current_job_id": first["id"]})
     lease = repo.create("leases", "owner", {"state": "active", "owner_job_id": first["id"], "instance_id": instance["id"], "account_id": "acct", "deadline_epoch": 9999, "handle": {"job_id": first["id"], "owner_job_id": first["id"]}})
+    repo.update("instances", instance["id"], {"lease_id": lease["id"]}, "owner")
     execution = repo.create("executions", "owner", {"state": "starting", "job_id": following["id"], "lease_id": "other-lease"})
     repo.update("jobs", first["id"], {"state": "cleaning_up", "lease_id": lease["id"], "instance_id": instance["id"], "compatibility_signature": "same"}, "owner")
     repo.update("jobs", following["id"], {"state": "waiting_for_capacity", "execution_id": execution["id"], "compatibility_signature": "same"}, "owner")

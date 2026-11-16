@@ -11,6 +11,8 @@ from app.gpu.repository import Repository
 from app.gpu.scheduler import Scheduler
 from app.presenters import public_job
 
+from tests.gpu.test_pr4_signoff_regressions import seed_execution_binding
+
 EVIDENCE = {"source": "runtime_nvidia_smi", "captured_at": 1000.0,
             "devices": [{"name": "NVIDIA L4", "memory_mib": 23034}]}
 EXECUTION = "11111111-1111-4111-8111-111111111111"
@@ -64,6 +66,7 @@ def running_job():
     lease = repo.create("leases", "owner", {"state": "active", "owner_job_id": job["id"], "account_id": "a", "instance_id": instance["id"]})
     repo.update("instances", instance["id"], {"lease_id": lease["id"]}, "owner")
     job = repo.update("jobs", job["id"], {"lease_id": lease["id"], "instance_id": instance["id"]}, "owner")
+    job = seed_execution_binding(repo, job, lease, instance=instance)
     return repo, job, instance, lease
 
 
@@ -93,8 +96,13 @@ def test_device_report_only_writes_the_owners_running_job():
 
 def test_device_report_skips_a_released_instance():
     repo, job, instance, lease = running_job()
+    before_version = job.get("version", 0)
     repo.update("instances", instance["id"], {"state": "deleted"}, "owner")
-    assert repo.record_gpu_diagnostics(job, EVIDENCE)["gpu_reported"] == "NVIDIA L4"
+    result = repo.record_gpu_diagnostics(job, EVIDENCE)
+    assert result is None or not result.get("gpu_reported")
+    saved = repo.get("jobs", job["id"], "owner")
+    assert saved.get("version", 0) == before_version
+    assert not saved.get("gpu_reported")
     assert not repo.get("instances", instance["id"], "owner").get("gpu_reported")
 
 
@@ -113,7 +121,8 @@ def test_cleanup_retry_clears_temporary_warning_and_preserves_generation_failure
     job = repo.create("jobs", "owner", {"state": "cleaning_up", "provider": "mock", "cleanup_final_state": "failed" if failure else "completed",
         **({"error_code": "gpu_execution_failed", "error_message": "generation failed"} if failure else {})})
     handle = provider.create({}, "request", job["id"], "runtime")
-    repo.create("leases", "owner", {"state": "active", "owner_job_id": job["id"], "handle": handle})
+    lease = repo.create("leases", "owner", {"state": "active", "owner_job_id": job["id"], "handle": handle})
+    job = repo.update("jobs", job["id"], {"lease_id": lease["id"]}, "owner")
     now = [1000.0]
     scheduler = Scheduler(repo, provider_factory=lambda job: provider, clock=lambda: now[0])
     pending = scheduler._cleanup(job)

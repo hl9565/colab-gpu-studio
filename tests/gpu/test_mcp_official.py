@@ -41,7 +41,7 @@ def test_official_session_resource_and_execute_stdout_not_python_repr():
             )
         assert args["session"].startswith("runtimes/studio-1/sessions/")
         assert "print(_json.dumps(_result" in args["code"]
-        text = json.dumps({"state": "running", "existing": True}) + "\n"
+        text = json.dumps({"state": "running", "existing": True, "worker_reported_execution_id": execution_id}) + "\n"
         return httpx.Response(
             200,
             json={

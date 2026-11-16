@@ -11,11 +11,21 @@ from app.gpu.scheduler import Scheduler
 class LedgerInstanceService:
     """Small offline stand-in for the InstanceService accounting boundary."""
 
-    def __init__(self, clock=lambda: 1_000.0):
+    def __init__(self, repo, clock=lambda: 1_000.0):
+        self.repo = repo
         self.clock = clock
         self.instances = {}
         self.segments = {}
         self._next = 0
+
+    def _save(self, instance):
+        payload = {"provider": "mock", **instance}
+        instance_id = instance["instance_id"]
+        if self.repo.get("instances", instance_id, "owner-1"):
+            self.repo.update("instances", instance_id, payload, "owner-1")
+        else:
+            self.repo.create("instances", "owner-1", payload, record_id=instance_id)
+        return dict(instance)
 
     def list(self, owner):
         return [dict(row) for row in self.instances.values()]
@@ -35,23 +45,23 @@ class LedgerInstanceService:
             "hard_deadline_at": self.clock() + 600,
         }
         self.instances[instance["instance_id"]] = instance
-        return dict(instance)
+        return self._save(instance)
 
     def bind_lease(self, job, lease):
         instance = self.instances[job["instance_id"]]
         instance["lease_id"] = lease["id"]
-        return dict(instance)
+        return self._save(instance)
 
     def mark_ready(self, job):
         instance = self.instances[job["instance_id"]]
         instance["state"] = "ready"
-        return dict(instance)
+        return self._save(instance)
 
     def job_busy(self, job):
         instance = self.instances[job["instance_id"]]
         instance["state"] = "busy"
         instance["current_job_id"] = job["id"]
-        return dict(instance)
+        return self._save(instance)
 
     def complete(self, job, success=True):
         instance = self.instances[job["instance_id"]]
@@ -59,14 +69,14 @@ class LedgerInstanceService:
         instance["state"] = "retained_idle" if success and instance["retention_mode"] == "retain" else "releasing"
         if instance["state"] == "retained_idle":
             instance["idle_deadline_at"] = self.clock() + 120
-        return dict(instance)
+        return self._save(instance)
 
     def mark_deleted(self, owner, instance_id, expected_version=None, remote_deleted=False):
         assert remote_deleted is True
         instance = self.instances[instance_id]
         instance["state"] = "deleted"
         instance["deletion_confirmed_at"] = self.clock()
-        return dict(instance)
+        return self._save(instance)
 
     def record_usage(self, owner, payload):
         assert payload["instance_id"] in self.instances
@@ -102,7 +112,7 @@ def run_to_terminal(scheduler, repo, job_id, limit=40):
 
 def test_normal_confirmed_delete_records_one_idempotent_instance_segment():
     repo = Repository(Store("sqlite:///:memory:"))
-    service = LedgerInstanceService()
+    service = LedgerInstanceService(repo)
     job = make_job(repo)
     provider, executor = MockColabProvider(), MockGPUExecutor()
     scheduler = Scheduler(
@@ -131,7 +141,7 @@ def test_normal_confirmed_delete_records_one_idempotent_instance_segment():
 def test_retained_instance_records_usage_only_after_idle_runtime_is_deleted():
     now = [1_000.0]
     repo = Repository(Store("sqlite:///:memory:"))
-    service = LedgerInstanceService(clock=lambda: now[0])
+    service = LedgerInstanceService(repo, clock=lambda: now[0])
     job = make_job(repo, lifecycle="retain")
     provider, executor = MockColabProvider(), MockGPUExecutor()
     scheduler = Scheduler(
@@ -157,7 +167,7 @@ def test_retained_instance_records_usage_only_after_idle_runtime_is_deleted():
 
 def test_orphan_confirmed_delete_records_instance_segment_without_actual_cu():
     repo = Repository(Store("sqlite:///:memory:"))
-    service = LedgerInstanceService()
+    service = LedgerInstanceService(repo)
     instance_id = "orphan-instance"
     service.instances[instance_id] = {
         "instance_id": instance_id,

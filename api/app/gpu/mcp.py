@@ -143,14 +143,66 @@ _execution_id = _base64.b64decode({encoded!r}).decode("ascii")
 _dir = _Path("/content/ai-studio") / _execution_id
 _status_path = _dir / "status.json"
 _meta_path = _dir / "meta.json"
+_marker_path = _dir / "marker.json"
 _limit = 100 * 1024 * 1024
-_result = {{"execution_id": _execution_id, "state": "running", "outputs": []}}
+_result = {{"execution_id": _execution_id, "state": "unknown", "outputs": [], "status_present": _status_path.is_file()}}
+_has_marker = _marker_path.is_file()
+_result["marker"] = _has_marker
 if not _status_path.exists():
-    _result["marker"] = (_dir / "marker.json").exists()
+    if _has_marker:
+        try:
+            _marker = _json.loads(_marker_path.read_text(encoding="utf-8"))
+        except Exception:
+            _marker = None
+        if isinstance(_marker, dict):
+            _m_exec = _marker.get("execution_id")
+            if isinstance(_m_exec, str) and _m_exec:
+                _result["launcher_execution_id"] = _m_exec
+            _m_state = _marker.get("state")
+            if isinstance(_m_state, str) and _m_state:
+                _result["marker_state"] = _m_state
+            if _m_exec == _execution_id:
+                _m_pid = _marker.get("pid")
+                if _m_state in ("launched", None) and type(_m_pid) is int and _m_pid > 0:
+                    _result["state"] = "running"
+                elif _m_state in ("reserved", "starting"):
+                    _result["state"] = _m_state
+        else:
+            _result["marker"] = False
 else:
+    _result["status_present"] = True
     _status = _json.loads(_status_path.read_text(encoding="utf-8"))
     if isinstance(_status, dict):
-        _result.update({{key: _status.get(key) for key in ("state", "error_code", "error_message", "stage", "timings", "stage_started", "gpu_diagnostics") if key in _status}})
+        _result.update({{key: _status.get(key) for key in (
+            "state",
+            "error_code",
+            "error_message",
+            "stage",
+            "timings",
+            "stage_started",
+            "gpu_diagnostics",
+            "worker_reported_execution_id",
+            "warm_saved",
+            "warm_epoch_id",
+            "warm_fingerprint",
+            "runtime_meta",
+        ) if key in _status}})
+        if _status.get("state") is None:
+            _result["state"] = "unknown"
+    if _has_marker:
+        try:
+            _marker = _json.loads(_marker_path.read_text(encoding="utf-8"))
+        except Exception:
+            _marker = None
+        if isinstance(_marker, dict):
+            _m_exec = _marker.get("execution_id")
+            if isinstance(_m_exec, str) and _m_exec:
+                _result["launcher_execution_id"] = _m_exec
+            _m_state = _marker.get("state")
+            if isinstance(_m_state, str) and _m_state:
+                _result["marker_state"] = _m_state
+        else:
+            _result["marker"] = False
     if _result.get("state") == "completed" and _meta_path.exists():
         _meta = _json.loads(_meta_path.read_text(encoding="utf-8"))
         _artifacts = _meta.get("artifacts") if isinstance(_meta, dict) else None
@@ -170,7 +222,8 @@ else:
                 continue
             _size = _file.stat().st_size
             if _size > _limit or _total + _size > _limit:
-                _result = {{"execution_id": _execution_id, "state": "failed", "error_code": "gpu_output_too_large", "error_message": "output exceeds 100MB"}}
+                _result["outputs"] = []
+                _result.update({{"state": "failed", "error_code": "gpu_output_too_large", "error_message": "output exceeds 100MB"}})
                 break
             _content = _file.read_bytes()
             _total += len(_content)
@@ -191,6 +244,7 @@ if _result.get('state') in ('running', 'starting', 'reserved'):
                 _dead = True
             except PermissionError:
                 _dead = False
+            _result["worker_process_alive"] = not _dead and _marker_data.get('execution_id') == _execution_id
             if _dead:
                 _result.update({{'state':'failed', 'error_code':'gpu_worker_exited',
                     'error_message':'Worker process exited before completion'}})
@@ -677,17 +731,52 @@ class MCPGPUExecutor:
             raise MCPError("Colab状态响应无效")
         if result.get("execution_id") not in {None, execution_id}:
             raise MCPError("Colab状态执行标识不匹配")
-        state = result.get("state", "running")
+        state = result.get("state")
+        marker = result.get("marker") if isinstance(result.get("marker"), bool) else None
+        marker_state = result.get("marker_state")
+        status_present = result.get("status_present") if isinstance(result.get("status_present"), bool) else None
         # The scheduler cleans gpu_diagnostics before saving it.
-        evidence = {"execution_id": execution_id, "gpu_diagnostics": result.get("gpu_diagnostics")}
-        if state in {"reserved", "starting", "running", None}:
-            stage = result.get("stage")
+        reported_id = result.get("worker_reported_execution_id")
+        evidence = {
+            "launcher_execution_id": result.get("launcher_execution_id"),
+            "worker_process_alive": result.get("worker_process_alive") is True,
+            "execution_id": execution_id,
+            "marker": marker,
+            "marker_state": marker_state if isinstance(marker_state, str) and marker_state else None,
+            "status_present": status_present,
+            "gpu_diagnostics": result.get("gpu_diagnostics"),
+            "worker_reported_execution_id": reported_id if isinstance(reported_id, str) and reported_id.strip() else None,
+            "warm_saved": result.get("warm_saved") if isinstance(result.get("warm_saved"), bool) else None,
+            "warm_epoch_id": result.get("warm_epoch_id") if isinstance(result.get("warm_epoch_id"), str) and result.get("warm_epoch_id") else None,
+            "warm_fingerprint": result.get("warm_fingerprint") if isinstance(result.get("warm_fingerprint"), str) and result.get("warm_fingerprint") else None,
+            "runtime_meta": dict(result["runtime_meta"]) if isinstance(result.get("runtime_meta"), dict) else None,
+        }
+        stage = result.get("stage")
+        timings = result.get("timings") if isinstance(result.get("timings"), dict) else {}
+        matching_worker = evidence["worker_reported_execution_id"] == execution_id
+        matching_process = (
+            evidence["worker_process_alive"] and evidence["launcher_execution_id"] == execution_id
+            and evidence["worker_reported_execution_id"] is None
+        )
+        mismatched_worker = reported_id is not None and reported_id != execution_id
+        if state in {"reserved", "starting", "unknown", None} or mismatched_worker or (
+            state == "running" and not (matching_worker or matching_process)
+        ):
+            mapped_state = state if state in {"reserved", "starting"} else "unknown"
+            return {
+                **evidence,
+                "state": mapped_state,
+                "outputs": [],
+                "stage": stage if isinstance(stage, str) else None,
+                "timings": timings,
+            }
+        if state == "running":
             return {
                 **evidence,
                 "state": "running",
                 "outputs": [],
                 "stage": stage if isinstance(stage, str) else None,
-                "timings": result.get("timings") if isinstance(result.get("timings"), dict) else {},
+                "timings": timings,
             }
         if state == "failed":
             return {

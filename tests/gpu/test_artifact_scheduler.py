@@ -8,6 +8,8 @@ from app.gpu.repository import Repository
 from app.gpu.scheduler import Scheduler
 from app.storage import asset_path
 
+from tests.gpu.test_pr4_signoff_regressions import seed_execution_binding
+
 
 def test_manifest_persists_one_asset_without_base64(tmp_path):
     repo = Repository(Store("sqlite:///:memory:"))
@@ -30,7 +32,8 @@ def test_manifest_persists_one_asset_without_base64(tmp_path):
         repo, provider_factory=lambda job: provider, executor_factory=lambda job: Executor()
     )
     handle = provider.create("owner", "artifact-request", job["id"], "artifact-runtime")
-    repo.create("leases", "owner", {"owner_job_id": job["id"], "state": "active", "handle": handle})
+    lease = repo.create("leases", "owner", {"owner_job_id": job["id"], "state": "active", "handle": handle})
+    job = seed_execution_binding(repo, job, lease)
     polled = scheduler._run(job)
     assert polled["state"] == "uploading", polled
     assert "content" not in str(polled["outputs"])
@@ -109,7 +112,8 @@ def test_worker_to_gallery_manifest_closed_loop(tmp_path,monkeypatch):
             return {'state':'completed',**manifest}
     provider=MockColabProvider()
     handle=provider.create({},'worker-gallery-request',job['id'],'worker-gallery-runtime')
-    repo.create('leases','owner',{'owner_job_id':job['id'],'state':'active','handle':handle})
+    lease = repo.create('leases','owner',{'owner_job_id':job['id'],'state':'active','handle':handle})
+    job = seed_execution_binding(repo, job, lease)
     scheduler=Scheduler(repo,provider_factory=lambda job:provider,executor_factory=lambda job:Executor())
     job=scheduler._run(job)
     job=scheduler._upload(job)

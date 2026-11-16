@@ -4,11 +4,14 @@ from app.gpu.mcp import MCPError, MCPTransient
 from app.gpu.repository import Repository
 from app.gpu.scheduler import Scheduler
 
+from tests.gpu.test_pr4_signoff_regressions import seed_execution_binding
+
 
 def setup_job(error):
     repo=Repository(Store('sqlite://'))
     job=repo.create('jobs','owner',{'state':'running','execution_id':'original-execution'})
-    repo.create('leases','owner',{'owner_job_id':job['id'],'state':'active','handle':{}})
+    lease = repo.create('leases','owner',{'owner_job_id':job['id'],'state':'active','handle':{}})
+    job = seed_execution_binding(repo, job, lease)
     class Executor:
         calls=0
         def poll(self,*args):

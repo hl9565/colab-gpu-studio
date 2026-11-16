@@ -119,14 +119,15 @@ def admit_job(st, user, body, key, *, validate_only=False):
         return existing
     project = own(st, "projects", body["project_id"], user)
     cfg = GpuConfig.from_env()
-    policy = _validate_allocation(repo, user, normalize_policy(body["execution_policy"]))
-    if policy["provider"] not in {"mock", "colab"}:
+    raw_policy = normalize_policy(body["execution_policy"])
+    if raw_policy["provider"] not in {"mock", "colab"}:
         raise APIError("PROVIDER_INVALID", "仅允许已配置的 mock 或 colab Provider")
-    if policy["provider"] == "colab" and not cfg.real_enabled:
+    if raw_policy["provider"] == "colab" and not cfg.real_enabled:
         raise APIError("REAL_GPU_DISABLED", "真实 GPU 默认关闭：请先配置 OAuth、费率预算并完成模型审查")
-    if policy["provider"] == "colab" and policy["lifecycle"] in {"smart", "retain"}:
+    if raw_policy["provider"] == "colab" and raw_policy["lifecycle"] in {"smart", "retain"}:
         if os.getenv("GPU_REAL_RETENTION_VERIFIED") != "1" and os.getenv("GPU_REAL_RETENTION_TEST_ENABLED") != "1":
             raise APIError("REAL_LIFECYCLE_UNVERIFIED", "真实 GPU 的智能/保留生命周期尚未完成真机验证", 503)
+    policy = _validate_allocation(repo, user, raw_policy)
     workflow = registry.get_workflow(user["id"], body["workflow_key"], body["workflow_version"])
     if workflow is None:
         raise APIError("WORKFLOW_UNPUBLISHED", "工作流未发布或与模型不匹配", 404)

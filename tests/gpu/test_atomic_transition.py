@@ -43,7 +43,7 @@ def test_stale_state_cannot_overwrite_newer_transition():
 def test_execution_preparation_is_atomic_and_idempotent():
     repo=Repository(Store('sqlite://'))
     job=repo.create('jobs','u',{'state':'loading'})
-    lease=repo.create('leases','u',{'state':'active'})
+    lease=repo.create('leases','u',{'state':'active','owner_job_id':job['id'],'handle':{'runtime_name':'runtimes/test-1'}})
     first=repo.prepare_execution(job['id'],'u',lease['id'],12)
     second=repo.prepare_execution(job['id'],'u',lease['id'],13)
     assert first['execution_id']==second['execution_id']

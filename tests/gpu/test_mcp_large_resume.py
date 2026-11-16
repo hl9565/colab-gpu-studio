@@ -13,6 +13,8 @@ from app.gpu.mcp import MCPGPUExecutor, MCPTransient
 from app.gpu.repository import Repository
 from app.gpu.scheduler import Scheduler
 
+from tests.gpu.test_pr4_signoff_regressions import seed_execution_binding
+
 
 def test_500mib_generated_reader_resumes_at_exact_sixty_percent(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, 'data_dir', tmp_path / 'local')
@@ -37,7 +39,8 @@ def test_500mib_generated_reader_resumes_at_exact_sixty_percent(tmp_path, monkey
     url = 'sqlite:///' + str(tmp_path / 'jobs.db')
     repo = Repository(Store(url))
     job = repo.create('jobs', 'owner', {'state': 'running', 'execution_id': execution, 'provider': 'mock'})
-    repo.create('leases', 'owner', {'owner_job_id': job['id'], 'state': 'active', 'handle': {}})
+    lease = repo.create('leases', 'owner', {'owner_job_id': job['id'], 'state': 'active', 'handle': {}})
+    job = seed_execution_binding(repo, job, lease)
     reads = [[], []]
     def executor(phase):
         value = object.__new__(MCPGPUExecutor)

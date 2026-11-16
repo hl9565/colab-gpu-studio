@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import contextvars
 import csv
 import hashlib
 import importlib.metadata
@@ -95,14 +96,89 @@ def _atomic_json(path: Path, value: Any) -> None:
     os.replace(temporary, path)
 
 
+_CURRENT_WARM_STATE: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar("_CURRENT_WARM_STATE", default=None)
+
+
 def _status(root: Path, state: str, **fields: Any) -> None:
     # Later stage updates keep the measured GPU so the coordinator can still poll it.
     path = root / "status.json"
     if "gpu_diagnostics" not in fields and path.exists():
-        previous = json.loads(path.read_text(encoding="utf-8")).get("gpu_diagnostics")
-        if previous:
-            fields["gpu_diagnostics"] = previous
+        try:
+            previous = json.loads(path.read_text(encoding="utf-8")).get("gpu_diagnostics")
+            if previous:
+                fields["gpu_diagnostics"] = previous
+        except (OSError, ValueError):
+            pass
     _atomic_json(root / "status.json", {"state": state, "updated_at": time.time(), **fields})
+
+
+def _python_mm() -> str:
+    return f"{sys.version_info.major}.{sys.version_info.minor}"
+
+
+def _runtime_meta() -> dict[str, Any]:
+    return {
+        "python_mm": _python_mm(),
+        "python": sys.version.split()[0],
+        "warm_version": WARM_VERSION,
+    }
+
+
+def _reported_execution_id(payload: Any) -> str | None:
+    if not isinstance(payload, dict):
+        return None
+    value = payload.get("execution_id")
+    if isinstance(value, str) and value.strip():
+        return value
+    return None
+
+
+def _build_terminal_fields(
+    payload: Any,
+    *,
+    warm_saved: bool = False,
+    warm_epoch_id: str | None = None,
+    warm_fingerprint: str | None = None,
+    runtime_meta: dict[str, Any] | None = None,
+    **extra: Any,
+) -> dict[str, Any]:
+    """Assemble all 5 warm-proof fields alongside terminal outcome fields."""
+    saved = bool(warm_saved)
+    fields: dict[str, Any] = {
+        "worker_reported_execution_id": _reported_execution_id(payload),
+        "warm_saved": saved,
+        "warm_epoch_id": warm_epoch_id if (saved and isinstance(warm_epoch_id, str) and warm_epoch_id) else None,
+        "warm_fingerprint": warm_fingerprint if (saved and isinstance(warm_fingerprint, str) and warm_fingerprint) else None,
+        "runtime_meta": dict(runtime_meta) if isinstance(runtime_meta, dict) else _runtime_meta(),
+    }
+    fields.update(extra)
+    return fields
+
+
+def _write_terminal_status(
+    root: Path,
+    state: str,
+    *,
+    payload: Any = None,
+    warm_saved: bool = False,
+    warm_epoch_id: str | None = None,
+    warm_fingerprint: str | None = None,
+    runtime_meta: dict[str, Any] | None = None,
+    **fields: Any,
+) -> None:
+    """Publish terminal state and warm proof in one atomic status.json replacement."""
+    _status(
+        root,
+        state,
+        **_build_terminal_fields(
+            payload,
+            warm_saved=warm_saved,
+            warm_epoch_id=warm_epoch_id,
+            warm_fingerprint=warm_fingerprint,
+            runtime_meta=runtime_meta,
+            **fields,
+        ),
+    )
 
 
 def _probe_gpu() -> dict | None:
@@ -686,18 +762,49 @@ def _remove(path: Path) -> None:
 WARM_VERSION = 1
 
 
-def _warm_fingerprint(commit: str, custom_nodes: list[dict], weights: list[dict]) -> str:
+def _resolve_comfy_commit(manifest: Any) -> str | None:
+    if not isinstance(manifest, dict):
+        return None
+    commit = manifest.get("comfy_commit")
+    if isinstance(commit, str) and commit.strip():
+        return commit.strip()
+    version = manifest.get("comfy_version")
+    if isinstance(version, str) and version.strip():
+        return version.strip()
+    return None
+
+
+def _warm_fingerprint(
+    commit: str,
+    custom_nodes: list[dict],
+    weights: list[dict],
+    *,
+    python_mm: str | None = None,
+) -> str:
     """What a restored ComfyUI tree must match for the next job on this runtime to reuse it as-is."""
     body = {
         "v": WARM_VERSION,
         "commit": commit,
-        "python": f"{sys.version_info.major}.{sys.version_info.minor}",
+        "python": python_mm or _python_mm(),
         "nodes": sorted(f"{n['repo']}@{n['commit']}" for n in custom_nodes),
         "weights": sorted(
             (w["target"], w["sha256"], w.get("size"), w.get("source", "huggingface")) for w in weights
         ),
     }
     return hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()
+
+
+def compute_manifest_warm_fingerprint(manifest: Any, *, python_mm: str | None = None) -> str | None:
+    """Compute the shared warm fingerprint from a manifest (`comfy_commit -> comfy_version`) and `python_mm`."""
+    commit = _resolve_comfy_commit(manifest)
+    if not commit or not COMMIT.fullmatch(commit):
+        return None
+    try:
+        nodes = _reviewed_custom_nodes((manifest or {}).get("custom_nodes"))
+        checked = _validate_weights(manifest or {})
+    except WorkerError:
+        return None
+    return _warm_fingerprint(commit, nodes, checked, python_mm=python_mm)
 
 
 def _warm_take(root: Path, fingerprint: str, custom_nodes: list[dict], weights: list[dict]) -> bool:
@@ -732,20 +839,39 @@ def _warm_take(root: Path, fingerprint: str, custom_nodes: list[dict], weights: 
     return True
 
 
-def _warm_put(root: Path, fingerprint: str) -> None:
+def _warm_put(
+    root: Path,
+    fingerprint: str,
+    *,
+    warm_epoch_id: str | None = None,
+    runtime_meta: dict[str, Any] | None = None,
+) -> str | None:
     """Park the restored tree where the next job on this runtime can pick it up."""
     tree = root / "ComfyUI"
     if not tree.is_dir():
-        return
+        return None
     warm = root.parent / ".warm"
+    epoch = warm_epoch_id or uuid.uuid4().hex
+    meta = dict(runtime_meta) if isinstance(runtime_meta, dict) else _runtime_meta()
     try:
         warm.mkdir(mode=0o700, exist_ok=True)
         (warm / "state.json").unlink(missing_ok=True)
         shutil.rmtree(warm / "ComfyUI", ignore_errors=True)
         tree.rename(warm / "ComfyUI")
-        _atomic_json(warm / "state.json", {"fingerprint": fingerprint, "saved_at": time.time()})
+        _atomic_json(
+            warm / "state.json",
+            {
+                "fingerprint": fingerprint,
+                "warm_epoch_id": epoch,
+                "runtime_meta": meta,
+                "saved_at": time.time(),
+            },
+        )
+        return epoch
     except OSError:  # the next job simply restores from the cache again
+        (warm / "state.json").unlink(missing_ok=True)
         shutil.rmtree(warm / "ComfyUI", ignore_errors=True)
+        return None
 
 
 def _restore_env(
@@ -1206,8 +1332,14 @@ def _stream_output(response, target: Path, limit: int) -> int:
         partial.unlink(missing_ok=True)
 
 
-def _run_comfy(root: Path, payload: dict, manifest: dict, graph: dict, stages: _Stages) -> list[dict]:
-    commit = manifest.get("comfy_commit", manifest.get("comfy_version"))
+def _run_comfy(
+    root: Path,
+    payload: dict,
+    manifest: dict,
+    graph: dict,
+    stages: _Stages,
+) -> list[dict]:
+    commit = _resolve_comfy_commit(manifest)
     if not isinstance(commit, str) or not COMMIT.fullmatch(commit):
         raise WorkerError("Comfy workflow must lock a 40-character commit")
     allowlist = manifest.get("node_allowlist")
@@ -1221,7 +1353,11 @@ def _run_comfy(root: Path, payload: dict, manifest: dict, graph: dict, stages: _
     timeout = min(float(payload.get("download_timeout_seconds", 600)), 600)
     nodes = _reviewed_custom_nodes(manifest.get("custom_nodes"))
     checked = _validate_weights(manifest)
-    fingerprint = _warm_fingerprint(commit, nodes, checked)
+    runtime_meta = _runtime_meta()
+    fingerprint = _warm_fingerprint(commit, nodes, checked, python_mm=runtime_meta["python_mm"])
+    warm_state = _CURRENT_WARM_STATE.get()
+    if isinstance(warm_state, dict):
+        warm_state.setdefault("runtime_meta", runtime_meta)
     if _warm_take(root, fingerprint, nodes, checked):
         # Same runtime, same environment: the previous job left it restored. Nothing to download.
         stages.start("warm_reuse")
@@ -1336,12 +1472,19 @@ def _run_comfy(root: Path, payload: dict, manifest: dict, graph: dict, stages: _
                     process.kill()
             log.close()
     finally:
-        _warm_put(root, fingerprint)  # restore succeeded above, so the tree is reusable even if this job failed later
+        epoch = _warm_put(root, fingerprint, runtime_meta=runtime_meta)  # restore succeeded above, so the tree is reusable even if this job failed later
+        if isinstance(warm_state, dict):
+            warm_state.update(
+                warm_saved=epoch is not None,
+                warm_epoch_id=epoch,
+                warm_fingerprint=fingerprint if epoch is not None else None,
+                runtime_meta=runtime_meta,
+            )
 
 
 def _run_prep(root: Path, payload: dict, manifest: dict, stages: _Stages) -> list[dict]:
     """CPU-only cache fill: build the env archive and put every missing weight into Drive. No sampling."""
-    commit = manifest.get("comfy_commit", manifest.get("comfy_version"))
+    commit = _resolve_comfy_commit(manifest)
     if not isinstance(commit, str) or not COMMIT.fullmatch(commit):
         raise WorkerError("Comfy workflow must lock a 40-character commit")
     if _drive_cache(payload) is None:
@@ -1380,6 +1523,12 @@ def _run_prep(root: Path, payload: dict, manifest: dict, stages: _Stages) -> lis
 
 def run_job(payload: dict, root: Path, *, artifact_store=None) -> None:
     stages = _Stages(root)
+    warm_state: dict[str, Any] = {
+        "warm_saved": False,
+        "warm_epoch_id": None,
+        "warm_fingerprint": None,
+        "runtime_meta": _runtime_meta(),
+    }
     try:
         _status(root, "running")
         snapshot, manifest, graph = _snapshot(payload)
@@ -1395,7 +1544,11 @@ def run_job(payload: dict, root: Path, *, artifact_store=None) -> None:
             outputs = _run_prep(root, payload, manifest, stages)
         else:
             local_payload = {**payload, '_local_artifact_limit': min(artifact_store.max_size, 2*1024**3)} if artifact_store is not None else {k:v for k,v in payload.items() if k!='_local_artifact_limit'}
-            outputs = _run_comfy(root, local_payload, manifest, graph, stages)
+            token = _CURRENT_WARM_STATE.set(warm_state)
+            try:
+                outputs = _run_comfy(root, local_payload, manifest, graph, stages)
+            finally:
+                _CURRENT_WARM_STATE.reset(token)
         if artifact_store is not None:
             artifacts = []
             for item in outputs:
@@ -1405,17 +1558,39 @@ def run_job(payload: dict, root: Path, *, artifact_store=None) -> None:
                 artifacts.append(artifact_store.publish_file(
                     payload['owner_id'], payload['execution_id'], source, item['mime']))
             _atomic_json(root / 'meta.json', {'execution_id': payload['execution_id'], 'artifacts': artifacts})
-            _status(root, 'completed', artifacts=artifacts, timings=stages.timings)
+            _write_terminal_status(
+                root,
+                'completed',
+                payload=payload,
+                **warm_state,
+                artifacts=artifacts,
+                timings=stages.timings,
+            )
         else:
             _atomic_json(root / "meta.json", {"execution_id": payload.get("execution_id"), "outputs": outputs})
-            _status(root, "completed", outputs=outputs, timings=stages.timings)
+            _write_terminal_status(
+                root,
+                "completed",
+                payload=payload,
+                **warm_state,
+                outputs=outputs,
+                timings=stages.timings,
+            )
     except Exception as exc:  # noqa: BLE001 - worker must persist every failure
         stages.end()
         message = _safe_error(exc)
         log = root / "comfy.log"
         if log.is_file():
             message = (message + " | comfy.log: " + log.read_text("utf-8", "replace")[-500:])[:1400]
-        _status(root, "failed", error_code="gpu_worker_failed", error_message=message, timings=stages.timings)
+        _write_terminal_status(
+            root,
+            "failed",
+            payload=payload,
+            **warm_state,
+            error_code="gpu_worker_failed",
+            error_message=message,
+            timings=stages.timings,
+        )
 
 
 class _MCPManifestStore:
@@ -1448,6 +1623,7 @@ def main(argv: list[str] | None = None) -> int:
     if len(argv) != 1:
         return 2
     payload_path = Path(argv[0]).resolve()
+    payload: Any = None
     try:
         payload = json.loads(payload_path.read_text(encoding="utf-8"))
         if not isinstance(payload, dict):
@@ -1468,7 +1644,17 @@ def main(argv: list[str] | None = None) -> int:
                 if isinstance(payload, dict)
                 else payload_path.parent
             )
-            _status(root, "failed", error_code="gpu_worker_bootstrap_failed", error_message=_safe_error(exc))
+            _write_terminal_status(
+                root,
+                "failed",
+                payload=payload,
+                warm_saved=False,
+                warm_epoch_id=None,
+                warm_fingerprint=None,
+                runtime_meta=_runtime_meta(),
+                error_code="gpu_worker_bootstrap_failed",
+                error_message=_safe_error(exc),
+            )
         except Exception:  # noqa: BLE001 - status persistence must not mask exit code
             return 1
         return 1

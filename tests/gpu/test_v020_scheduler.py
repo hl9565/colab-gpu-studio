@@ -9,12 +9,22 @@ from app.gpu.scheduler import Scheduler
 class FakeInstanceService:
     """Offline v0.2 instance boundary used to prove scheduler coordination."""
 
-    def __init__(self, *, lifecycle="retain", clock=lambda: 1_000.0):
+    def __init__(self, repo, *, lifecycle="retain", clock=lambda: 1_000.0):
+        self.repo = repo
         self.clock = clock
         self.lifecycle = lifecycle
         self.instances = {}
         self.calls = []
         self._next = 0
+
+    def _save(self, instance):
+        payload = {"provider": "mock", **instance}
+        instance_id = instance["instance_id"]
+        if self.repo.get("instances", instance_id, "owner-1"):
+            self.repo.update("instances", instance_id, payload, "owner-1")
+        else:
+            self.repo.create("instances", "owner-1", payload, record_id=instance_id)
+        return dict(instance)
 
     def list(self, owner):
         return [dict(row) for row in self.instances.values()]
@@ -36,27 +46,27 @@ class FakeInstanceService:
             "compatibility_signature": job.get("compatibility_signature"),
         }
         self.instances[instance["instance_id"]] = instance
-        return dict(instance)
+        return self._save(instance)
 
     def bind_lease(self, job, lease):
         self.calls.append(("bind_lease", job["id"], lease["id"]))
         instance = self.instances[job["instance_id"]]
         instance["lease_id"] = lease["id"]
         instance["state"] = "allocating"
-        return dict(instance)
+        return self._save(instance)
 
     def mark_ready(self, job):
         self.calls.append(("mark_ready", job["id"]))
         instance = self.instances[job["instance_id"]]
         instance["state"] = "ready"
-        return dict(instance)
+        return self._save(instance)
 
     def job_busy(self, job):
         self.calls.append(("job_busy", job["id"]))
         instance = self.instances[job["instance_id"]]
         instance["state"] = "busy"
         instance["current_job_id"] = job["id"]
-        return dict(instance)
+        return self._save(instance)
 
     def complete(self, job, success=True):
         self.calls.append(("complete", job["id"], success))
@@ -67,7 +77,7 @@ class FakeInstanceService:
             instance["idle_deadline_at"] = self.clock() + 120
         else:
             instance["state"] = "releasing"
-        return dict(instance)
+        return self._save(instance)
 
     def mark_deleted(self, owner, instance_id, expected_version=None, remote_deleted=False):
         assert owner == "owner-1"
@@ -84,11 +94,11 @@ class FakeInstanceService:
 
     def retention(self, instance, retain=True, **kwargs):
         self.calls.append(("retention", instance["instance_id"], retain))
-        return dict(instance)
+        return self._save(instance)
 
     def stop(self, instance):
         self.calls.append(("stop", instance["instance_id"]))
-        return dict(instance)
+        return self._save(instance)
 
 
 def make_job(repo, *, key="job", lifecycle="retain"):
@@ -117,7 +127,7 @@ def run_to_terminal(scheduler, repo, job_id, limit=40):
 def test_v020_allocates_and_binds_instance_before_execution():
     repo = Repository(Store("sqlite:///:memory:"))
     job = make_job(repo)
-    service = FakeInstanceService()
+    service = FakeInstanceService(repo)
     provider, executor = MockColabProvider(), MockGPUExecutor()
     scheduler = Scheduler(
         repo,
@@ -137,14 +147,15 @@ def test_v020_allocates_and_binds_instance_before_execution():
     lease = repo.get("leases", result["lease_id"], "owner-1")
     assert lease["instance_id"] == "instance-1"
     assert [call[0] for call in service.calls[:3]] == ["allocate", "bind_lease", "mark_ready"]
-    assert ("job_busy", job["id"]) in service.calls
+    assert any(event["state"] == "busy" and event.get("job_id") == job["id"]
+               for event in repo.list("events", "owner-1"))
 
 
 def test_v020_retained_instance_survives_completed_job_and_watchdog_until_deadline():
     now = [1_000.0]
     repo = Repository(Store("sqlite:///:memory:"))
     job = make_job(repo, lifecycle="retain")
-    service = FakeInstanceService(clock=lambda: now[0])
+    service = FakeInstanceService(repo, clock=lambda: now[0])
     provider, executor = MockColabProvider(), MockGPUExecutor()
     scheduler = Scheduler(
         repo,
@@ -179,7 +190,7 @@ def test_v020_save_requires_remote_delete_confirmation_before_marking_deleted():
 
     repo = Repository(Store("sqlite:///:memory:"))
     job = make_job(repo, lifecycle="save")
-    service = FakeInstanceService(lifecycle="save")
+    service = FakeInstanceService(repo, lifecycle="save")
     provider, executor = AcceptedButNotGoneProvider(), MockGPUExecutor()
     scheduler = Scheduler(
         repo,

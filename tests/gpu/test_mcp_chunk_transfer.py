@@ -7,6 +7,8 @@ import pytest
 from app.gpu.artifacts import LocalArtifactStore
 from app.gpu.mcp import MCPGPUExecutor, MCPTransient, build_chunk_code
 
+from tests.gpu.test_pr4_signoff_regressions import seed_execution_binding
+
 
 def test_remote_manifest_transfer_resumes_after_interruption(tmp_path,monkeypatch):
     execution=str(uuid.uuid4())
@@ -38,9 +40,11 @@ def test_remote_manifest_transfer_resumes_after_interruption(tmp_path,monkeypatc
     from app.db import Store
     from app.gpu.repository import Repository
     from app.gpu.scheduler import Scheduler
+
     repo=Repository(Store('sqlite://'))
     job=repo.create('jobs','owner',{'state':'running','execution_id':execution})
-    repo.create('leases','owner',{'owner_job_id':job['id'],'state':'active','handle':{}})
+    lease = repo.create('leases','owner',{'owner_job_id':job['id'],'state':'active','handle':{}})
+    job = seed_execution_binding(repo, job, lease)
     first,_=executor(True)
     clock=[100.0]
     interrupted=Scheduler(repo,executor_factory=lambda _:first,clock=lambda:clock[0])._run(job)
@@ -147,7 +151,8 @@ def test_cli_to_mcp_reader_to_private_gallery(tmp_path,monkeypatch):
         def poll(self,*args):
             return result
     scheduler=Scheduler(repo,executor_factory=lambda _:Executor())
-    repo.create('leases','owner',{'owner_job_id':job['id'],'state':'active','handle':{}})
+    lease = repo.create('leases','owner',{'owner_job_id':job['id'],'state':'active','handle':{}})
+    job = seed_execution_binding(repo, job, lease)
     job=scheduler._upload(scheduler._run(job))
     assert job['state']=='cleaning_up'
     asset=repo.store.get('assets',job['output_asset_ids'][0],'owner')

@@ -83,7 +83,7 @@ def test_immediate_allocation_failure_is_classified_and_absence_is_confirmed():
         def create(self, *args):
             raise ColabAllocationError(9, "NO_RUNTIMES")
         def inspect(self, handle):
-            return {"deleted": True, "allocation_failed": True}
+            return {"deleted": True, "allocation_failed": True, "remote_verified": True}
     scheduler = Scheduler(repo, provider_factory=lambda job: Provider())
     failed = scheduler._allocation(job)
     assert failed["state"] == "cleaning_up" and failed["error_code"] == "gpu_capacity_unavailable"

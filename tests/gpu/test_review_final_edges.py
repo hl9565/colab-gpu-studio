@@ -28,6 +28,7 @@ def _orphan_repo():
         },
         record_id="lease",
     )
+    repo.update("instances", instance["id"], {"lease_id": lease["id"]}, "owner")
     return repo, instance, lease
 
 

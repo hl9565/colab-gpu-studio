@@ -22,7 +22,19 @@ from sqlalchemy.exc import IntegrityError
 
 from app.db import utc_isoformat
 
+from .estimator import (
+    check_job_reuse_guard,
+    is_legacy_mock_job,
+    load_session_history,
+    min_deadlines,
+)
 from .manifest import digest
+from .repository import (
+    extract_runtime_id,
+    extract_tunnel_endpoint,
+    has_conflicting_active_runtime,
+    lease_has_active_origin,
+)
 
 
 class InstanceServiceError(RuntimeError):
@@ -51,6 +63,21 @@ class InstanceService:
 
     _INSTANCE_STATES = {"requested", "allocating", "ready", "busy", "retained_idle", "releasing", "deleted", "unknown", "cleanup_pending", "quarantined"}
     _IDLE_STATES = {"ready", "retained_idle"}
+    _TERMINAL_OR_CLEANUP_STATES = {"releasing", "deleted", "unknown", "cleanup_pending", "quarantined"}
+    _ALLOWED_TRANSITIONS = {
+        "requested": {"allocating", "releasing", "cleanup_pending", "deleted", "unknown", "quarantined"},
+        "allocating": {
+            "allocating", "ready", "busy", "retained_idle", "releasing", "cleanup_pending", "deleted", "unknown", "quarantined",
+        },
+        "ready": {"allocating", "ready", "busy", "retained_idle", "releasing", "cleanup_pending", "deleted", "unknown", "quarantined"},
+        "busy": {"busy", "retained_idle", "releasing", "cleanup_pending", "deleted", "unknown", "quarantined"},
+        "retained_idle": {"allocating", "retained_idle", "releasing", "cleanup_pending", "deleted", "unknown", "quarantined"},
+        "releasing": {"releasing", "cleanup_pending", "deleted", "unknown", "quarantined"},
+        "cleanup_pending": {"cleanup_pending", "deleted", "unknown", "quarantined"},
+        "unknown": {"unknown", "releasing", "cleanup_pending", "deleted", "quarantined"},
+        "quarantined": {"quarantined"},
+        "deleted": {"deleted"},
+    }
     _SENSITIVE = {"token", "access_token", "refresh_token", "connectioninfo", "connection_info", "handle", "secret", "password", "authorization", "signed_url"}
     _PUBLIC = {
         "id", "owner_id", "project_id", "state", "version", "account_id", "account_alias_snapshot", "provider",
@@ -129,12 +156,31 @@ class InstanceService:
             row.state = state
         return row
 
+    def _set_validated_state(self, session, row, payload: dict, state: str, *, expected_version: int | None = None):
+        """Enforce the Allowed-Transition Matrix and anti-resurrection invariants before CAS."""
+        if state not in self._INSTANCE_STATES:
+            raise InstanceConflict(f"未知的实例状态: {state}")
+        allowed = self._ALLOWED_TRANSITIONS.get(row.state, set())
+        if state not in allowed:
+            raise InstanceConflict(f"不允许的实例状态转换: {row.state} -> {state}")
+        if state in {"allocating", "ready", "busy", "retained_idle"}:
+            if (
+                payload.get("runtime_deleted")
+                or payload.get("remote_deleted")
+                or payload.get("manual_stop_requested")
+                or payload.get("cleanup_claim_token")
+            ):
+                raise InstanceConflict("已停止或已删除/清理中的实例不能恢复为可运行状态")
+        if state in {"ready", "busy", "retained_idle"}:
+            payload["ever_active"] = True
+        return self._set(row, payload, state=state, expected_version=expected_version, session=session)
+
     def _find(self, session, kind, record_id, owner_id=None):
         model = self._model(kind)
         stmt = select(model).where(model.id == record_id)
         if owner_id is not None:
             stmt = stmt.where(model.owner_id == owner_id)
-        return session.scalar(stmt)
+        return session.scalar(stmt.with_for_update())
 
     def _rows(self, session, kind, owner_id=None):
         model = self._model(kind)
@@ -165,7 +211,9 @@ class InstanceService:
         if not isinstance(job_id, str) or not job_id:
             raise AllocationError("job id is required for persistent allocation")
         attempt = job.get("attempt_id") or job.get("attempt_number") or job.get("attempt") or 1
-        return f"{job_id}:{attempt}", str(uuid.uuid5(uuid.NAMESPACE_URL, f"colab-gpu-instance:{job_id}:{attempt}"))
+        alloc_gen = int(job.get("alloc_generation") or 0)
+        suffix = f"{job_id}:{attempt}:gen{alloc_gen}" if alloc_gen > 0 else f"{job_id}:{attempt}"
+        return suffix, str(uuid.uuid5(uuid.NAMESPACE_URL, f"colab-gpu-instance:{suffix}"))
 
     # ---- account, budget and selection --------------------------------------------
     def _account_id(self, row):
@@ -360,7 +408,13 @@ class InstanceService:
         self._set(cursor, data, state="active", session=session)
         return selected
 
-    def _compatible(self, instance, job, account_id):
+    def _guard_mode(self) -> str:
+        raw = self._cfg("reuse_lifetime_guard_mode", None)
+        if raw is None or not str(raw).strip():
+            return "enforce"
+        return str(raw).strip().lower()
+
+    def _compatible(self, instance, job, account_id, *, session=None):
         data = self._data(instance)
         if self._value(data, "account_id") != account_id:
             return False
@@ -374,20 +428,171 @@ class InstanceService:
             if deadline is not None and float(deadline) <= now:
                 return False
         signature = job.get("compatibility_signature")
-        return not signature or data.get("compatibility_signature") == signature
+        if signature and data.get("compatibility_signature") != signature:
+            return False
+
+        lease_data = None
+        lease_id = data.get("lease_id")
+        if session is not None and lease_id:
+            try:
+                lease_row = self._find(session, "leases", lease_id, job.get("owner_id"))
+            except ValueError:
+                lease_row = None
+            if lease_row is not None:
+                lease_data = {**self._data(lease_row), "id": lease_row.id}
+                if lease_row.state in {"cleanup_pending", "releasing", "deleting", "quarantined", "deleted"} or lease_row.state != "idle":
+                    return False
+                if not isinstance(lease_data.get("handle"), dict) or not lease_data["handle"]:
+                    return False
+                lease_idle = lease_data.get("idle_deadline_at")
+                if lease_idle is not None and float(lease_idle) <= now:
+                    return False
+
+        guard_mode = self._guard_mode()
+        if guard_mode == "off" or is_legacy_mock_job(job):
+            return True
+
+        history_jobs = ()
+        executions_by_id = None
+        usage_by_job = None
+        if session is not None and job.get("owner_id"):
+            try:
+                history_jobs, executions_by_id, usage_by_job = load_session_history(
+                    session,
+                    job["owner_id"],
+                    self._model("jobs"),
+                    self._model("executions"),
+                    self._model("usage"),
+                )
+            except ValueError:
+                history_jobs = ()
+
+        deadlines = (
+            data.get("hard_deadline_at"),
+            lease_data.get("hard_deadline_at") if lease_data else None,
+            lease_data.get("deadline_epoch") if lease_data else None,
+            job.get("hard_deadline_at"),
+            job.get("deadline_epoch"),
+        )
+        allowed, _ = check_job_reuse_guard(
+            job,
+            guard_mode=guard_mode,
+            now=now,
+            instance_data={**data, "id": instance.id},
+            lease_data=lease_data,
+            deadlines=deadlines,
+            history_jobs=history_jobs,
+            executions_by_id=executions_by_id,
+            usage_by_job=usage_by_job,
+            observe_cb=(
+                (
+                    lambda assessment: self._emit(
+                        session,
+                        job.get("owner_id"),
+                        instance.project_id,
+                        instance.id,
+                        job.get("id"),
+                        "reuse_lifetime_observed",
+                        f"reuse window observed ({assessment.reason})",
+                        extra={
+                            "event": "reuse_lifetime_observed",
+                            "lease_id": lease_id,
+                            "remaining_s": assessment.remaining_seconds,
+                            "need_s": assessment.need_seconds,
+                            "warm_verified": assessment.warm_verified,
+                            "evidence_source": assessment.evidence_source,
+                            "sampling_source": assessment.sampling_source,
+                            "would_allow": assessment.can_reuse,
+                            "reason": assessment.reason,
+                        },
+                    )
+                )
+                if session is not None
+                else None
+            ),
+        )
+        return allowed
 
     def _claim_existing(self, session, instance, job, account, key, stable_id, reason, units):
         data = self._data(instance)
+        if instance.state in self._TERMINAL_OR_CLEANUP_STATES or data.get("manual_stop_requested") or data.get("runtime_deleted") or data.get("remote_deleted") or data.get("cleanup_claim_token"):
+            raise InstanceConflict("实例处于不可复用状态")
         if data.get("current_job_id") not in {None, job.get("id")}:
             raise InstanceConflict("实例已被其他任务占用")
+        from .repository import extract_runtime_id, retarget_handle
+
+        now = self.clock()
+        job_for_bind = dict(job)
+        lease_id = data.get("lease_id")
+        lease_row = None
+        if lease_id:
+            try:
+                lease_row = self._find(session, "leases", lease_id, job.get("owner_id"))
+            except ValueError:
+                lease_row = None
+        claim_rt = extract_runtime_id(lease_row) if lease_row is not None else extract_runtime_id(data)
+        claim_ep = extract_tunnel_endpoint(lease_row) if lease_row is not None else extract_tunnel_endpoint(data)
+        claim_handle = self._data(lease_row).get("handle") if lease_row is not None else data.get("handle")
+        self._ensure_no_conflicting_non_deleted_lease(
+            session,
+            instance.id,
+            exclude_lease_id=lease_id,
+            runtime_id=claim_rt,
+            tunnel_endpoint=claim_ep,
+            handle=claim_handle,
+            lease=lease_row,
+            instance=instance,
+            job=job,
+        )
+        if lease_row is not None:
+            lease_data = {**self._data(lease_row), "id": lease_row.id}
+            if (
+                lease_row.state in {"deleted", "deleting", "cleanup_pending", "releasing", "quarantined", "unknown"}
+                or bool(lease_data.get("cleanup_claim_token"))
+                or bool(lease_data.get("manual_stop_requested"))
+                or bool(lease_data.get("runtime_deleted"))
+                or bool(lease_data.get("remote_deleted"))
+                or bool(lease_data.get("deleted"))
+            ):
+                raise InstanceConflict("实例关联租约正在清理或已失效，不能复用")
+            if lease_row.state == "idle":
+                handle = lease_data.get("handle")
+                if not isinstance(handle, dict) or not handle:
+                    raise InstanceConflict("实例关联租约缺少有效句柄，不能复用")
+                idle_dl = lease_data.get("idle_deadline_at")
+                if idle_dl is not None and now >= float(idle_dl):
+                    raise InstanceConflict("实例闲置租约已过期")
+                tight_deadline = min_deadlines(
+                    data.get("hard_deadline_at"),
+                    lease_data.get("hard_deadline_at"),
+                    lease_data.get("deadline_epoch"),
+                    job.get("hard_deadline_at"),
+                    job.get("deadline_epoch"),
+                )
+                if tight_deadline is not None:
+                    if now >= tight_deadline:
+                        raise InstanceConflict("实例寿命不足")
+                    data["hard_deadline_at"] = tight_deadline
+                    job_for_bind["deadline_epoch"] = tight_deadline
+                lease_data.update(
+                    state="active",
+                    owner_job_id=job["id"],
+                    current_job_id=job["id"],
+                    idle_deadline_at=None,
+                    last_active_at=now,
+                    handle=retarget_handle(handle, job["id"]),
+                )
+                self._set(lease_row, lease_data, state="active", expected_version=lease_row.version, session=session)
+                job_for_bind["lease_id"] = lease_row.id
+
         data.update(
             current_job_id=job["id"], account_id=self._account_id(account), allocation_key=key,
             selection_reason=reason, budget_reserved=units, retention_reserved=0.0,
-            allocation_requested_at=data.get("allocation_requested_at") or self.clock(), last_seen_at=self.clock(),
+            allocation_requested_at=data.get("allocation_requested_at") or now, last_seen_at=now,
             manual_stop_requested=False, runtime_deleted=False, idle_deadline_at=None,
         )
-        self._set(instance, data, state="allocating", expected_version=instance.version, session=session)
-        self._bind_job_rows(session, job, instance, account, units)
+        self._set_validated_state(session, instance, data, "allocating", expected_version=instance.version)
+        self._bind_job_rows(session, job_for_bind, instance, account, units)
         self._emit(session, job["owner_id"], instance.project_id, instance.id, job["id"], "allocating", "instance allocated")
         return self._dict(instance)
 
@@ -436,6 +641,10 @@ class InstanceService:
                 data["drive_account_id"] = drive_account_id
             if job.get("lease_id") is not None:
                 data["lease_id"] = job["lease_id"]
+            if job.get("deadline_epoch") is not None:
+                tight = min_deadlines(data.get("deadline_epoch"), job["deadline_epoch"])
+                if tight is not None:
+                    data["deadline_epoch"] = tight
             self._set(job_row, data, state=job_row.state, session=session)
         execution_id = job.get("execution_id")
         if execution_id:
@@ -448,24 +657,117 @@ class InstanceService:
                 data.update(instance_id=instance.id, account_id=self._account_id(account))
                 self._set(execution, data, state=execution.state, session=session)
 
-    def allocate(self, job) -> dict:
+    def allocate(self, job, *, atomic_lease: bool = False) -> dict:
         if not isinstance(job, Mapping):
             raise AllocationError("job must be an object")
         owner_id = job.get("owner_id")
         project_id = job.get("project_id")
         if not owner_id:
             raise AllocationError("job owner is required")
-        key, stable_id = self._attempt_key(job)
-        requested_instance = self._requested(job, "instance_id")
-        requested_account = self._requested(job, "account_id")
-        provider = self._provider(job)
         with self._admission(), self._tx() as session:
+            job_model = self._model("jobs")
+            job_row = (
+                session.scalar(
+                    select(job_model)
+                    .where(job_model.id == job.get("id"), job_model.owner_id == owner_id)
+                    .with_for_update()
+                )
+                if job.get("id")
+                else None
+            )
+            if job_row is None:
+                raise AllocationError("任务不存在或已删除，拒绝分配实例")
+            jdata = self._data(job_row)
+            allocatable_states = {"queued", "waiting", "validating", "waiting_for_capacity", "allocating"}
+            caller_state = job.get("state")
+            if job_row.state not in allocatable_states or (
+                caller_state is not None and caller_state not in allocatable_states
+            ):
+                raise InstanceConflict(
+                    f"job state is not allocatable ({job_row.state})"
+                )
+            if (
+                bool(jdata.get("cancel_requested"))
+                or bool(job.get("cancel_requested"))
+                or jdata.get("requested_outcome") == "cancelled"
+                or job.get("requested_outcome") == "cancelled"
+                or bool(jdata.get("manual_stop_requested"))
+                or bool(job.get("manual_stop_requested"))
+                or bool(jdata.get("stop_requested"))
+                or bool(job.get("stop_requested"))
+                or bool(jdata.get("runtime_deleted"))
+                or bool(job.get("runtime_deleted"))
+                or bool(jdata.get("remote_deleted"))
+                or bool(job.get("remote_deleted"))
+                or bool(jdata.get("deleted"))
+                or bool(job.get("deleted"))
+                or bool(jdata.get("cleanup_claim_token"))
+                or bool(jdata.get("cleanup_claim"))
+            ):
+                raise InstanceConflict("任务已停止、取消或终态，拒绝分配实例")
+            effective_job = dict(job)
+            merged_policy = {**(jdata.get("execution_policy") or {})}
+            req_policy = effective_job.get("execution_policy") or {}
+            if "lifecycle" not in merged_policy and req_policy.get("lifecycle") in {"save", "batch", "smart", "retain"}:
+                merged_policy["lifecycle"] = req_policy["lifecycle"]
+            effective_job = {
+                **effective_job,
+                **jdata,
+                "execution_policy": merged_policy,
+                "id": job_row.id,
+                "owner_id": owner_id,
+                "project_id": job_row.project_id or project_id,
+                "state": job_row.state,
+            }
+            key, stable_id = self._attempt_key(effective_job)
+            requested_instance = self._requested(effective_job, "instance_id")
+            requested_account = self._requested(effective_job, "account_id")
+            provider = self._provider(effective_job)
             model = self._model("instances")
             existing = session.scalar(select(model).where(model.owner_id == owner_id, model.id == stable_id))
-            if existing is None:
-                existing = session.scalar(select(model).where(model.owner_id == owner_id)) if False else None
             if existing is not None and self._data(existing).get("allocation_key") == key:
+                edata = self._data(existing)
+                job_instance_id = (
+                    (job_row.instance_id or (job_row.data or {}).get("instance_id"))
+                    if job_row is not None
+                    else None
+                )
+                if (
+                    existing.state in (self._TERMINAL_OR_CLEANUP_STATES | {"unknown", "quarantined", "releasing", "cleanup_pending", "deleted"})
+                    or bool(edata.get("cleanup_claim_token"))
+                    or bool(edata.get("manual_stop_requested"))
+                    or bool(edata.get("runtime_deleted"))
+                    or bool(edata.get("remote_deleted"))
+                    or edata.get("current_job_id") != effective_job.get("id")
+                    or (
+                        job_row is not None
+                        and (
+                            job_row.state in (
+                                {"completed", "failed", "cancelled", "cleaning_up", "cleanup_pending"}
+                                if atomic_lease
+                                else {"failed", "cancelled", "cleaning_up", "cleanup_pending"}
+                            )
+                            or bool((job_row.data or {}).get("cancel_requested"))
+                            or job_instance_id != existing.id
+                        )
+                    )
+                    or (
+                        provider != "mock"
+                        and not is_legacy_mock_job(effective_job)
+                        and float(edata.get("budget_reserved") or 0.0) <= 0.0
+                    )
+                ):
+                    raise InstanceConflict("已删除或围栏实例禁止复用重建")
+                if atomic_lease and not edata.get("lease_id"):
+                    account = self._account_row(session, edata.get("account_id"), owner_id)
+                    return self._attach_atomic_creating_lease(session, existing, effective_job, account, edata.get("budget_reserved", 0.0))
                 return self._dict(existing)
+            if job_row is not None:
+                bound_inst_id = job_row.instance_id or (job_row.data or {}).get("instance_id")
+                if bound_inst_id not in {None, stable_id}:
+                    bound_inst = self._find(session, "instances", bound_inst_id, owner_id)
+                    if bound_inst is not None and bound_inst.state != "deleted":
+                        raise InstanceConflict("任务已绑定其他活跃实例")
             accounts = self._legal_accounts(session, owner_id, project_id, provider, requested_account)
             account_id = self._account_id(accounts[0]) if requested_account else None
 
@@ -479,18 +781,26 @@ class InstanceService:
                 if requested_account and data.get("account_id") != account_id:
                     raise AllocationError("指定实例与账号冲突")
                 account = next((a for a in accounts if self._account_id(a) == data.get("account_id")), None)
-                if account is None or not self._compatible(instance, job, self._account_id(account)):
+                if account is None or not self._compatible(instance, effective_job, self._account_id(account), session=session):
                     raise InstanceConflict("指定实例不兼容或已被占用")
-                units = self._reserve_budget(session, job, account, provider)
-                return self._claim_existing(session, instance, job, account, key, stable_id, "requested_instance", units)
+                units = self._reserve_budget(session, effective_job, account, provider)
+                allocated = self._claim_existing(session, instance, effective_job, account, key, stable_id, "requested_instance", units)
+                if atomic_lease and not allocated.get("lease_id"):
+                    row = self._find(session, "instances", allocated["id"], owner_id)
+                    return self._attach_atomic_creating_lease(session, row, effective_job, account, units)
+                return allocated
 
             # Reuse is deliberately attempted before advancing the persistent RR cursor.
-            idle = [r for r in self._rows(session, "instances", owner_id) if r.id != stable_id and r.state not in {"unknown", "cleanup_pending"}]
+            idle = [
+                r
+                for r in self._rows(session, "instances", owner_id)
+                if r.id != stable_id and r.state not in self._TERMINAL_OR_CLEANUP_STATES
+            ]
             if requested_account:
                 account = accounts[0]
-                candidates = [r for r in idle if self._compatible(r, job, self._account_id(account))]
+                candidates = [r for r in idle if self._compatible(r, effective_job, self._account_id(account), session=session)]
             else:
-                candidates = [r for r in idle if any(self._compatible(r, job, self._account_id(a)) for a in accounts)]
+                candidates = [r for r in idle if any(self._compatible(r, effective_job, self._account_id(a), session=session) for a in accounts)]
                 account = None
                 if candidates:
                     selected = sorted(candidates, key=lambda r: r.updated_at or r.created_at, reverse=True)[0]
@@ -498,12 +808,128 @@ class InstanceService:
                     candidates = [selected]
             if candidates:
                 instance = candidates[0]
-                units = self._reserve_budget(session, job, account, provider)
-                return self._claim_existing(session, instance, job, account, key, stable_id, "reuse_idle", units)
+                units = self._reserve_budget(session, effective_job, account, provider)
+                allocated = self._claim_existing(session, instance, effective_job, account, key, stable_id, "reuse_idle", units)
+                if atomic_lease and not allocated.get("lease_id"):
+                    row = self._find(session, "instances", allocated["id"], owner_id)
+                    return self._attach_atomic_creating_lease(session, row, effective_job, account, units)
+                return allocated
 
             account = accounts[0] if requested_account else self._choose_account(session, accounts, owner_id, project_id)
-            units = self._reserve_budget(session, job, account, provider)
-            return self._create_instance(session, job, account, key, stable_id, units, "requested_account" if requested_account else "round_robin")
+            units = self._reserve_budget(session, effective_job, account, provider)
+            allocated = self._create_instance(session, effective_job, account, key, stable_id, units, "requested_account" if requested_account else "round_robin")
+            if atomic_lease:
+                row = self._find(session, "instances", allocated["id"], owner_id)
+                return self._attach_atomic_creating_lease(session, row, effective_job, account, units)
+            return allocated
+
+    def _ensure_no_conflicting_non_deleted_lease(
+        self,
+        session,
+        instance_id: str,
+        *,
+        exclude_lease_id: str | None = None,
+        runtime_id: str | None = None,
+        tunnel_endpoint: str | None = None,
+        handle: object = None,
+        lease: object = None,
+        instance: object = None,
+        job: object = None,
+    ) -> None:
+        conflict, _ = has_conflicting_active_runtime(
+            session,
+            instance_id=instance_id,
+            runtime_id=runtime_id,
+            tunnel_endpoint=tunnel_endpoint,
+            handle=handle,
+            lease=lease,
+            instance=instance,
+            job=job,
+            exclude_lease_id=exclude_lease_id,
+            exclude_instance_id=instance_id,
+        )
+        if conflict:
+            raise InstanceConflict("实例或 runtime_id 上已存在其他非终态租约")
+
+    def _attach_atomic_creating_lease(self, session, instance, job, account, units):
+        """Create and bind the initial creating lease + create intent inside the allocate tx."""
+        if not job.get("id"):
+            return self._dict(instance)
+        data = self._data(instance)
+        if data.get("lease_id"):
+            existing_lease = self._find(session, "leases", data["lease_id"], instance.owner_id)
+            if existing_lease is not None and existing_lease.state != "deleted":
+                return self._dict(instance)
+        self._ensure_no_conflicting_non_deleted_lease(
+            session,
+            instance.id,
+            runtime_id=extract_runtime_id(data),
+            tunnel_endpoint=extract_tunnel_endpoint(data),
+            instance=instance,
+            job=job,
+        )
+        leases_model = self._model("leases")
+        lease_id = str(uuid.uuid4())
+        request_id = str(uuid.uuid4())
+        runtime_id = f"studio-{uuid.uuid4().hex}"
+        now = self.clock()
+        policy = self._job_policy(job)
+        runtime_minutes = float(job.get("max_runtime_minutes") or policy.get("max_runtime_minutes") or self._cfg("max_runtime_minutes", 30) or 30)
+        deadline = min_deadlines(
+            job.get("deadline_epoch"),
+            job.get("hard_deadline_at"),
+            data.get("hard_deadline_at"),
+            now + runtime_minutes * 60,
+        )
+        intent_id = str(uuid.uuid4())
+        account_id = self._account_id(account) if account is not None else data.get("account_id")
+        lease_payload = {
+            "owner_job_id": job["id"],
+            "current_job_id": job["id"],
+            "provider": self._provider(job),
+            "state": "creating",
+            "request_id": request_id,
+            "runtime_id": runtime_id,
+            "created_epoch": now,
+            "last_seen": now,
+            "delete_attempts": 0,
+            "create_attempts": 0,
+            "deadline_epoch": deadline,
+            "instance_id": instance.id,
+            "instance_bound": True,
+            "account_id": account_id,
+            "create_intent_origin": "new",
+            "create_intent": {
+                "intent_id": intent_id,
+                "origin": "new",
+                "from_active": False,
+                "state": "pending",
+                "created_at": now,
+            },
+        }
+        now_dt = self._utcnow()
+        lease_row = leases_model(
+            id=lease_id,
+            owner_id=instance.owner_id,
+            project_id=instance.project_id,
+            account_id=account_id,
+            instance_id=instance.id,
+            state="creating",
+            data=lease_payload,
+            version=0,
+            created_at=now_dt,
+            updated_at=now_dt,
+        )
+        session.add(lease_row)
+        session.flush()
+        data.update(lease_id=lease_id, current_job_id=job["id"], last_seen_at=now)
+        if deadline is not None:
+            tightened = min_deadlines(data.get("hard_deadline_at"), deadline)
+            if tightened is not None:
+                data["hard_deadline_at"] = tightened
+        self._set_validated_state(session, instance, data, instance.state)
+        self._bind_job_rows(session, {**dict(job), "lease_id": lease_id, "deadline_epoch": deadline}, instance, account, units)
+        return self._dict(instance)
 
     # ---- scheduler lifecycle -------------------------------------------------------
     def _instance_for_job(self, session, job, owner_id=None):
@@ -519,14 +945,21 @@ class InstanceService:
             instance = self._instance_for_job(session, job)
             if instance is None:
                 raise AllocationError("job has no instance")
-            if instance.state == "unknown":
-                raise InstanceConflict("unknown instance cannot be advanced")
+            if instance.state in (self._TERMINAL_OR_CLEANUP_STATES | {"unknown", "quarantined", "releasing", "cleanup_pending", "deleted"}):
+                raise InstanceConflict(f"instance in state {instance.state} cannot advance to {state}")
             data = self._data(instance)
+            if (
+                data.get("cleanup_claim_token")
+                or data.get("manual_stop_requested")
+                or data.get("runtime_deleted")
+                or data.get("remote_deleted")
+            ):
+                raise InstanceConflict("instance is fenced by stop, deletion, or cleanup")
             if data.get("current_job_id") not in {None, job.get("id")}:
                 raise InstanceConflict("instance is owned by another job")
             data["current_job_id"] = job.get("id")
             data["last_seen_at"] = self.clock()
-            self._set(instance, data, state=state, session=session)
+            self._set_validated_state(session, instance, data, state)
             self._emit(session, instance.owner_id, instance.project_id, instance.id, job.get("id"), state, message)
             return self._dict(instance)
 
@@ -541,6 +974,8 @@ class InstanceService:
             instance = self._instance_for_job(session, job)
             if instance is None:
                 raise AllocationError("job has no instance")
+            if instance.state in {"deleted", "unknown", "quarantined"}:
+                raise InstanceConflict(f"instance in state {instance.state} cannot complete")
             data = self._data(instance)
             if data.get("current_job_id") not in {None, job.get("id")}:
                 raise InstanceConflict("instance is owned by another job")
@@ -549,10 +984,51 @@ class InstanceService:
             # not turn an explicitly retained instance back into a release.
             mode = data.get("retention_mode") or job.get("lifecycle") or policy.get("lifecycle") or "save"
             hard = data.get("hard_deadline_at")
-            retain = success and mode in {"retain", "smart"} and not data.get("manual_stop_requested") and (hard is None or self.clock() < float(hard))
+            from .repository import extract_runtime_id
+
+            lease_fenced = False
+            lease_id = data.get("lease_id") or job.get("lease_id")
+            lease_row = self._find(session, "leases", lease_id, instance.owner_id) if lease_id else None
+            lease_rt = extract_runtime_id(lease_row) if lease_row is not None else (extract_runtime_id(data) or extract_runtime_id(job))
+            self._ensure_no_conflicting_non_deleted_lease(
+                session,
+                instance.id,
+                exclude_lease_id=lease_id,
+                runtime_id=lease_rt,
+                lease=lease_row,
+                instance=instance,
+                job=job,
+            )
+            if lease_row is not None:
+                ldata = self._data(lease_row)
+                if ldata.get("owner_job_id") not in {None, job.get("id")}:
+                    raise InstanceConflict("instance lease is owned by another job")
+                lease_fenced = (
+                    lease_row.state in {"cleanup_pending", "releasing", "deleting", "quarantined", "deleted"}
+                    or bool(ldata.get("cleanup_claim_token"))
+                    or bool(ldata.get("manual_stop_requested"))
+                    or bool(ldata.get("runtime_deleted"))
+                    or bool(ldata.get("remote_deleted"))
+                    or ldata.get("owner_job_id") not in {None, job.get("id")}
+                    or ldata.get("current_job_id") not in {None, job.get("id")}
+                )
+            cleanup_locked = (
+                instance.state in {"releasing", "cleanup_pending"}
+                or bool(data.get("manual_stop_requested"))
+                or bool(data.get("runtime_deleted"))
+                or bool(data.get("remote_deleted"))
+                or bool(data.get("cleanup_claim_token"))
+                or lease_fenced
+            )
+            retain = (
+                success
+                and not cleanup_locked
+                and mode in {"retain", "smart"}
+                and (hard is None or self.clock() < float(hard))
+            )
             data.update(current_job_id=None, last_seen_at=self.clock(), retention_mode=mode)
-            state = "retained_idle" if retain else "releasing"
             if retain:
+                state = "retained_idle"
                 minutes = (
                     policy.get("retain_idle_minutes")
                     or data.get("retain_idle_minutes")
@@ -560,8 +1036,11 @@ class InstanceService:
                 )
                 minutes = min(30.0, max(1.0, float(minutes)))
                 data["retain_idle_minutes"] = minutes
-                data["idle_deadline_at"] = min(self.clock() + float(minutes) * 60, float(hard)) if hard is not None else self.clock() + float(minutes) * 60
-            self._set(instance, data, state=state, session=session)
+                data["idle_deadline_at"] = min_deadlines(self.clock() + float(minutes) * 60, hard)
+            else:
+                state = "cleanup_pending" if instance.state == "cleanup_pending" else "releasing"
+                data.update(idle_deadline_at=None, retention_reserved=0.0)
+            self._set_validated_state(session, instance, data, state)
             self._emit(session, instance.owner_id, instance.project_id, instance.id, job.get("id"), state, "job completed" if success else "job failed")
             return self._dict(instance)
 
@@ -576,33 +1055,71 @@ class InstanceService:
             if instance is None:
                 raise AllocationError("job has no instance")
             data = self._data(instance)
-            if instance.state in {"deleted", "unknown", "releasing", "cleanup_pending", "quarantined"}:
+            if instance.state in (self._TERMINAL_OR_CLEANUP_STATES | {"unknown", "quarantined", "releasing", "cleanup_pending", "deleted"}):
                 raise InstanceConflict("实例正在清理，不能接管租约")
-            if data.get("cleanup_claim_token"):
-                raise InstanceConflict("实例已被清理流程围栏")
+            if data.get("cleanup_claim_token") or data.get("manual_stop_requested") or data.get("runtime_deleted") or data.get("remote_deleted"):
+                raise InstanceConflict("实例已被清理或停止围栏")
             if data.get("current_job_id") not in {None, job.get("id")}:
                 raise InstanceConflict("instance is owned by another job")
-            deadline = lease_data.get("hard_deadline_at") or lease_data.get("deadline_epoch")
+            job_row = self._find(session, "jobs", job.get("id"), instance.owner_id)
+            if job_row is not None and (
+                job_row.state in {"completed", "failed", "cancelled", "cleaning_up", "cleanup_pending"}
+                or bool((job_row.data or {}).get("cancel_requested"))
+            ):
+                raise InstanceConflict("任务已停止或取消，不能接管租约")
+            lease_row = self._find(session, "leases", lease_id, instance.owner_id)
+            if lease_row is None:
+                raise InstanceConflict("租约不存在或归属不匹配")
+            lease_payload = self._data(lease_row)
+            if lease_row.state in {"cleanup_pending", "releasing", "deleting", "quarantined", "deleted"}:
+                raise InstanceConflict("租约正在清理或已删除，不能接管")
+            if (
+                lease_payload.get("cleanup_claim_token")
+                or lease_payload.get("manual_stop_requested")
+                or lease_payload.get("runtime_deleted")
+                or lease_payload.get("remote_deleted")
+            ):
+                raise InstanceConflict("租约已被清理或停止围栏")
+            if lease_payload.get("owner_job_id") != job.get("id"):
+                raise InstanceConflict("租约不属于当前任务")
+            if lease_payload.get("current_job_id") not in {None, job.get("id")}:
+                raise InstanceConflict("租约当前被其他任务占用")
+            lease_instance = lease_row.instance_id or lease_payload.get("instance_id")
+            if lease_instance not in {None, instance.id}:
+                raise InstanceConflict("租约已绑定到其他实例")
+            from .repository import extract_runtime_id
+
+            existing_lease_id = data.get("lease_id")
+            if existing_lease_id not in {None, lease_id}:
+                existing_lease_row = self._find(session, "leases", existing_lease_id, instance.owner_id)
+                if existing_lease_row is None or existing_lease_row.state != "deleted":
+                    raise InstanceConflict("实例已绑定其他未删除租约")
+            self._ensure_no_conflicting_non_deleted_lease(
+                session,
+                instance.id,
+                exclude_lease_id=lease_id,
+                runtime_id=extract_runtime_id(lease_payload) or extract_runtime_id(lease_data) or extract_runtime_id(data),
+                tunnel_endpoint=extract_tunnel_endpoint(lease_payload) or extract_tunnel_endpoint(lease_data) or extract_tunnel_endpoint(data),
+                handle=lease_payload.get("handle") or lease_data.get("handle") or data.get("handle"),
+                lease=lease_row,
+                instance=instance,
+                job=job,
+            )
+            deadline = min_deadlines(lease_data.get("hard_deadline_at"), lease_data.get("deadline_epoch"))
             current = data.get("hard_deadline_at")
-            if deadline is not None:
-                deadline = float(deadline)
-                data["hard_deadline_at"] = min(float(current), deadline) if current is not None else deadline
+            tightened = min_deadlines(current, deadline)
+            if tightened is not None:
+                data["hard_deadline_at"] = tightened
             data.update(lease_id=lease_id, current_job_id=job.get("id"), last_seen_at=self.clock())
-            self._set(instance, data, state=instance.state, session=session)
+            self._set_validated_state(session, instance, data, instance.state)
             account = self._account_row(session, data.get("account_id"), instance.owner_id)
             self._bind_job_rows(session, {**dict(job), "lease_id": lease_id}, instance, account, data.get("budget_reserved", 0.0))
-            try:
-                lease_row = self._find(session, "leases", lease_id, instance.owner_id)
-            except ValueError:
-                lease_row = None
-            if lease_row is not None:
-                lease_payload = self._data(lease_row)
-                lease_payload.update(instance_id=instance.id, account_id=data.get("account_id"))
-                self._set(lease_row, lease_payload, state=lease_row.state, session=session)
-                if hasattr(lease_row, "instance_id"):
-                    lease_row.instance_id = instance.id
-                if hasattr(lease_row, "account_id"):
-                    lease_row.account_id = data.get("account_id")
+            lease_payload.update(instance_id=instance.id, account_id=data.get("account_id"))
+            self._set(lease_row, lease_payload, state=lease_row.state, session=session)
+            if hasattr(lease_row, "instance_id"):
+                lease_row.instance_id = instance.id
+            if hasattr(lease_row, "account_id"):
+                lease_row.account_id = data.get("account_id")
             return self._dict(instance)
 
     def _account_row(self, session, account_id, owner_id):
@@ -652,9 +1169,40 @@ class InstanceService:
                 raise KeyError(id)
             if expected_version is not None and int(instance.version) != int(expected_version):
                 raise InstanceConflict("instance version conflict")
-            if instance.state in {"releasing", "deleted", "unknown", "cleanup_pending", "quarantined"}:
+            if instance.state in self._TERMINAL_OR_CLEANUP_STATES:
                 raise InstanceConflict("instance can no longer be retained")
             data = self._data(instance)
+            if mode in {"retain", "smart"} and (
+                data.get("manual_stop_requested")
+                or data.get("runtime_deleted")
+                or data.get("remote_deleted")
+                or data.get("cleanup_claim_token")
+            ):
+                raise InstanceConflict("stopped or deleting instance can no longer be retained")
+            if mode in {"retain", "smart"}:
+                from .repository import extract_runtime_id
+
+                lease_id = data.get("lease_id")
+                lease_row = self._find(session, "leases", lease_id, owner) if lease_id else None
+                if lease_row is not None:
+                    ldata = self._data(lease_row)
+                    if (
+                        lease_row.state in {"cleanup_pending", "releasing", "deleting", "quarantined", "deleted", "unknown"}
+                        or ldata.get("cleanup_claim_token")
+                        or ldata.get("manual_stop_requested")
+                        or ldata.get("runtime_deleted")
+                        or ldata.get("remote_deleted")
+                    ):
+                        raise InstanceConflict("instance lease can no longer be retained")
+                lease_rt = extract_runtime_id(lease_row) if lease_row is not None else extract_runtime_id(data)
+                self._ensure_no_conflicting_non_deleted_lease(
+                    session,
+                    instance.id,
+                    exclude_lease_id=lease_id,
+                    runtime_id=lease_rt,
+                    lease=lease_row,
+                    instance=instance,
+                )
             provider = data.get("provider", "mock")
             hard = data.get("hard_deadline_at")
             if mode in {"retain", "smart"}:
@@ -667,8 +1215,7 @@ class InstanceService:
                     self._check_budget(session, account, max(0.0, retention_units - previous))
                 data["retention_reserved"] = retention_units
                 data["retain_idle_minutes"] = minutes
-                deadline = self.clock() + minutes * 60
-                data["idle_deadline_at"] = min(deadline, float(hard)) if hard is not None else deadline
+                data["idle_deadline_at"] = min_deadlines(self.clock() + minutes * 60, hard)
                 data["retention_mode"] = mode
                 # Retention is an explicit lifecycle transition.  The
                 # scheduler may still finish the current job afterwards, but
@@ -677,7 +1224,7 @@ class InstanceService:
             else:
                 data.update(retention_mode="save", idle_deadline_at=None, retention_reserved=0.0)
                 state = "releasing" if data.get("current_job_id") is None else instance.state
-            self._set(instance, data, state=state, session=session)
+            self._set_validated_state(session, instance, data, state)
             result = self.public(self._dict(instance))
             self._finish_operation(operation, result, session)
             self._emit(session, owner, instance.project_id, id, data.get("current_job_id"), state, "retention updated")
@@ -696,39 +1243,230 @@ class InstanceService:
                 raise KeyError(id)
             if instance.state == "deleted":
                 result = self._dict(instance)
-            elif instance.state == "unknown":
-                raise InstanceConflict("unknown instance requires reconciliation before stop")
+            elif instance.state in {"unknown", "quarantined"}:
+                raise InstanceConflict("unknown or quarantined instance requires reconciliation before stop")
             else:
                 data = self._data(instance)
                 data.update(
                     manual_stop_requested=True, retention_mode="save", idle_deadline_at=None,
                     retention_reserved=0.0, last_seen_at=self.clock(),
                 )
-                self._set(instance, data, state="releasing", session=session)
+                target_state = "cleanup_pending" if instance.state == "cleanup_pending" else "releasing"
+                self._set_validated_state(session, instance, data, target_state)
                 result = self._dict(instance)
-                self._emit(session, owner, instance.project_id, id, data.get("current_job_id"), "releasing", "manual stop requested")
+                self._emit(session, owner, instance.project_id, id, data.get("current_job_id"), target_state, "manual stop requested")
             self._finish_operation(operation, self.public(result), session)
             return result
 
-    def mark_deleted(self, owner, id, expected_version=None, confirmed=False, remote_deleted=False):
+    def quarantine(self, owner, id, reason="gpu_runtime_identity_missing", *, expected_version=None):
+        """Quarantine an ambiguous runtime identity instance without freeing reserved budget."""
         with self._admission(), self._tx() as session:
             instance = self._find(session, "instances", id, owner)
             if instance is None:
                 raise KeyError(id)
+            if instance.state == "quarantined":
+                return self._dict(instance)
+            if expected_version is not None and int(instance.version) != int(expected_version):
+                raise InstanceConflict("instance version conflict")
+            data = self._data(instance)
+            now = self.clock()
+            data.update(
+                quarantined_reason=reason,
+                cleanup_claim_token=None,
+                cleanup_claimed_at=None,
+                last_seen_at=now,
+            )
+            self._set_validated_state(session, instance, data, "quarantined")
+            self._emit(session, owner, instance.project_id, id, data.get("current_job_id"), "quarantined", reason)
+            return self._dict(instance)
+
+    def _is_instance_pure(self, session, instance, *, lease_id=None):
+        data = self._data(instance)
+        if instance.state not in {"allocating", "unknown"}:
+            return False, f"state={instance.state}"
+        if (
+            data.get("ever_active")
+            or data.get("from_active_missing_handle")
+            or data.get("was_active_missing_handle")
+            or data.get("runtime_created")
+            or data.get("active_execution") is not None
+            or data.get("warm_proof") is not None
+            or data.get("runtime_deleted")
+            or data.get("remote_deleted")
+        ):
+            return False, "instance has runtime history"
+        check_lease_id = lease_id or data.get("lease_id")
+        job_model = self._model("jobs")
+        owner_jobs = session.scalars(select(job_model).where(job_model.owner_id == instance.owner_id)).all()
+        assoc_job_ids: set[str] = set()
+        for jrow in owner_jobs:
+            jdata = jrow.data or {}
+            j_inst = jrow.instance_id or jdata.get("instance_id")
+            j_lease = jdata.get("lease_id")
+            j_intent = jdata.get("start_intent") if isinstance(jdata.get("start_intent"), Mapping) else {}
+            if (
+                j_inst == instance.id
+                or j_intent.get("instance_id") == instance.id
+                or (check_lease_id and (j_lease == check_lease_id or j_intent.get("lease_id") == check_lease_id))
+                or (data.get("current_job_id") and jrow.id == data.get("current_job_id") and (check_lease_id is None or j_lease in {None, check_lease_id}))
+            ):
+                assoc_job_ids.add(jrow.id)
+                if jdata.get("execution_id") is not None or jdata.get("active_execution") is not None:
+                    return False, "associated job has execution evidence"
+        exec_model = self._model("executions")
+        exec_rows = session.scalars(select(exec_model)).all()
+        if any(
+            ((e.data or {}).get("instance_id") or e.instance_id) == instance.id
+            or (check_lease_id and (e.data or {}).get("lease_id") == check_lease_id)
+            or ((e.data or {}).get("job_id") in assoc_job_ids)
+            for e in exec_rows
+        ):
+            return False, "instance has execution rows"
+        from .identity import row_has_positive_usage
+        from .repository import extract_runtime_id
+
+        seg_model = self._model("instance_usage_segments")
+        for seg in session.scalars(select(seg_model).where(seg_model.owner_id == instance.owner_id)).all():
+            if not row_has_positive_usage(seg):
+                continue
+            sdata = seg.data or {}
+            seg_inst = seg.instance_id or sdata.get("instance_id")
+            if (
+                seg_inst == instance.id
+                or (check_lease_id and sdata.get("lease_id") == check_lease_id)
+                or (sdata.get("job_id") in assoc_job_ids)
+            ):
+                return False, "instance has positive usage segments"
+        usage_model = self._model("usage")
+        for urow in session.scalars(select(usage_model).where(usage_model.owner_id == instance.owner_id)).all():
+            if not row_has_positive_usage(urow):
+                continue
+            udata = urow.data or {}
+            if (
+                udata.get("instance_id") == instance.id
+                or (check_lease_id and udata.get("lease_id") == check_lease_id)
+                or (udata.get("job_id") in assoc_job_ids)
+            ):
+                return False, "instance has positive usage"
+
+        if (
+            data.get("ever_active")
+            or data.get("runtime_created")
+            or data.get("active_execution") is not None
+            or data.get("warm_proof") is not None
+            or bool(data.get("handle"))
+            or bool(data.get("runtime_name"))
+            or extract_tunnel_endpoint(data)
+            or data.get("tunnel_nbh") is not None
+            or bool(data.get("operation_name"))
+        ):
+            return False, "instance has runtime evidence"
+        target_runtime_id = extract_runtime_id(data)
+        lease_row = None
+        if check_lease_id:
+            lease_row = self._find(session, "leases", check_lease_id, instance.owner_id)
+            if lease_row is not None:
+                ldata = self._data(lease_row)
+                target_runtime_id = extract_runtime_id(lease_row) or target_runtime_id
+                create_intent = ldata.get("create_intent")
+                has_active_origin = lease_has_active_origin(ldata, lease_row.state)
+                non_pending_intent = create_intent is not None and not (
+                    isinstance(create_intent, Mapping) and create_intent.get("state") == "pending"
+                )
+                has_started_create = bool(
+                    int(ldata.get("create_attempts") or 0) > 0
+                    or ldata.get("create_rpc_in_flight")
+                    or ldata.get("create_rpc_started_at")
+                    or ldata.get("create_intent_id")
+                    or ldata.get("create_started")
+                    or ldata.get("selected_spec")
+                    or non_pending_intent
+                )
+                if (
+                    lease_row.state not in {"creating", "unknown"}
+                    or has_started_create
+                    or has_active_origin
+                    or bool(ldata.get("handle"))
+                    or bool(ldata.get("runtime_name"))
+                    or extract_tunnel_endpoint(lease_row)
+                    or ldata.get("tunnel_nbh") is not None
+                    or bool(ldata.get("operation_name"))
+                    or bool(ldata.get("cleanup_claim_token"))
+                    or bool(ldata.get("manual_stop_requested"))
+                    or bool(ldata.get("runtime_deleted"))
+                    or bool(ldata.get("remote_deleted"))
+                    or ldata.get("active_execution") is not None
+                    or ldata.get("warm_proof") is not None
+                ):
+                    return False, "lease has runtime evidence"
+        if (
+            has_conflicting_active_runtime(
+                session,
+                instance_id=instance.id,
+                runtime_id=target_runtime_id,
+                lease=lease_row,
+                instance=instance,
+                exclude_lease_id=check_lease_id,
+                exclude_instance_id=instance.id,
+            )[0]
+        ):
+            return False, "instance has other non-deleted leases"
+        return True, "pure"
+
+    def retire_pure_placeholder(self, owner, id, *, lease_id=None, expected_version=None):
+        """Retire an uncreated pure placeholder instance as deleted before bounded reallocation."""
+        with self._admission(), self._tx() as session:
+            instance = self._find(session, "instances", id, owner)
+            if instance is None:
+                raise KeyError(id)
+            if expected_version is not None and int(instance.version) != int(expected_version):
+                raise InstanceConflict("instance version conflict")
+            pure, reason = self._is_instance_pure(session, instance, lease_id=lease_id)
+            if not pure:
+                raise InstanceConflict(f"instance is not a pure uncreated placeholder ({reason})")
+            data = self._data(instance)
+            now = self.clock()
+            data.update(
+                current_job_id=None,
+                runtime_deleted=True,
+                retired_pure_placeholder=True,
+                retention_reserved=0.0,
+                deleted_at=now,
+                deletion_confirmed_at=now,
+                last_seen_at=now,
+            )
+            self._set_validated_state(session, instance, data, "deleted")
+            self._emit(session, owner, instance.project_id, id, None, "deleted", "pure placeholder retired")
+            return self._dict(instance)
+
+    def mark_deleted(self, owner, id, expected_version=None, confirmed=False, remote_deleted=False, job_id=None):
+        with self._admission(), self._tx() as session:
+            instance = self._find(session, "instances", id, owner)
+            if instance is None:
+                raise KeyError(id)
+            data = self._data(instance)
+            if job_id is not None and data.get("current_job_id") not in {None, job_id}:
+                raise InstanceConflict("instance is owned by another job")
+            lease_id = data.get("lease_id")
+            if job_id is not None and lease_id:
+                lease_row = self._find(session, "leases", lease_id, owner)
+                if lease_row is not None and lease_row.state != "deleted":
+                    ldata = self._data(lease_row)
+                    if ldata.get("owner_job_id") not in {None, job_id} or ldata.get("current_job_id") not in {None, job_id}:
+                        raise InstanceConflict("instance lease is owned by another job")
             if instance.state == "deleted":
                 return self._dict(instance)
             if expected_version is not None and instance.version != expected_version:
                 raise InstanceConflict("instance version conflict")
             if confirmed is not True and remote_deleted is not True:
                 raise InstanceConflict("remote deletion must be confirmed before marking deleted")
-            data = self._data(instance)
             confirmed_at = self.clock()
             data.update(
                 current_job_id=None, runtime_deleted=True, remote_deleted=True,
                 retention_reserved=0.0, deleted_at=confirmed_at, deletion_confirmed_at=confirmed_at,
                 last_seen_at=confirmed_at,
             )
-            self._set(instance, data, state="deleted", session=session)
+            self._set_validated_state(session, instance, data, "deleted")
             self._emit(session, owner, instance.project_id, id, None, "deleted", "remote deletion confirmed")
             return self._dict(instance)
 
@@ -743,7 +1481,7 @@ class InstanceService:
         if not segment_key:
             segment_key = digest({k: payload.get(k) for k in ("job_id", "started_at", "ended_at", "kind")})
         segment_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"colab-gpu-usage:{owner}:{instance_id}:{segment_key}"))
-        with self._tx() as session:
+        with self._admission(), self._tx() as session:
             instance = self._find(session, "instances", instance_id, owner)
             if instance is None:
                 raise KeyError(instance_id)
@@ -798,12 +1536,16 @@ class InstanceService:
     record_usage_segment = record_usage
     record_usage_once = record_usage
 
-    def _emit(self, session, owner, project_id, instance_id, job_id, state, message):
+    def _emit(self, session, owner, project_id, instance_id, job_id, state, message, *, extra=None):
         try:
             model = self._model("events")
         except ValueError:
             return
         data = {"instance_id": instance_id, "job_id": job_id, "state": state, "message": str(message)[:500]}
+        if isinstance(extra, Mapping):
+            for key, value in extra.items():
+                if str(key).lower() not in self._SENSITIVE:
+                    data[key] = copy.deepcopy(value)
         now = self._utcnow()
         session.add(model(id=str(uuid.uuid4()), owner_id=owner, project_id=project_id, state=state, version=0, data=data, created_at=now, updated_at=now))
 

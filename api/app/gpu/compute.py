@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import sys
+import uuid
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -19,7 +21,14 @@ class ComputeProvider(Protocol):
     def list_specs(self) -> list[dict]: ...
     def create(self, spec: dict, request_id: str, job_id: str, runtime_id: str) -> dict: ...
     def inspect(self, handle: dict) -> dict: ...
-    def delete(self, handle: dict) -> bool: ...
+
+    def delete(self, handle: dict) -> bool | dict:
+        """Verify remote deletion/absence and return True (or verified deleted proof) only once confirmed.
+
+        Returning False (or a pending/unverified dict) means remote absence is not yet proven
+        and callers must retain budget/quota reservations and retry later.
+        """
+        ...
 
 
 class GPUExecutor(Protocol):
@@ -50,6 +59,7 @@ class GpuConfig:
     trusted_executor_version: str = ""
     trusted_executor_allowlist: tuple[str, ...] = ()
     trusted_executor_cache_namespace: str = "trusted"
+    reuse_lifetime_guard_mode: str = "enforce"
 
     @staticmethod
     def _bool(name: str, default: bool) -> bool:
@@ -78,6 +88,10 @@ class GpuConfig:
             for item in os.getenv("GPU_TRUSTED_EXECUTOR_ALLOWLIST", "").split(",")
             if item.strip()
         )
+        raw_guard_mode = os.getenv("GPU_REUSE_LIFETIME_GUARD_MODE")
+        guard_mode = "enforce" if raw_guard_mode is None or not raw_guard_mode.strip() else raw_guard_mode.strip().lower()
+        if guard_mode not in {"off", "observe", "enforce"}:
+            raise ValueError("GPU_REUSE_LIFETIME_GUARD_MODE must be one of: off, observe, enforce")
         return cls(
             enabled=cls._bool("GPU_ENABLED", True),
             real_enabled=False if os.getenv("STUDIO_OFFLINE_TEST") == "1" else cls._bool("GPU_REAL_ENABLED", False),
@@ -98,6 +112,7 @@ class GpuConfig:
             trusted_executor_version=os.getenv("GPU_TRUSTED_EXECUTOR_VERSION", "").strip(),
             trusted_executor_allowlist=trusted_allowlist,
             trusted_executor_cache_namespace=os.getenv("GPU_TRUSTED_EXECUTOR_CACHE_NAMESPACE", "trusted").strip(),
+            reuse_lifetime_guard_mode=guard_mode,
         )
 
 
@@ -149,6 +164,7 @@ class MockColabProvider:
         }
         self._runtimes[name] = handle
         self._deleted.discard(name)
+        self._tombstones.pop(name, None)
         return dict(handle)
 
     def _verify_handle(self, handle):
@@ -184,13 +200,34 @@ class MockColabProvider:
 
     def inspect(self, handle: dict) -> dict:
         self.inspect_calls += 1
-        self._verify_handle(handle)
+        record = self._verify_handle(handle)
         name = handle.get("runtime_name")
-        if name in self._deleted or name not in self._runtimes:
-            return {"ready": False, "deleted": True, "runtime_name": name, "mock": True}
-        return {**self._runtimes[name], "ready": True, "deleted": False}
+        if name in self._runtimes:
+            return {**self._runtimes[name], "ready": True, "deleted": False, "remote_verified": True}
+        if (
+            bool(name)
+            and name in self._deleted
+            and name in self._tombstones
+            and record is self._tombstones.get(name)
+        ):
+            return {
+                "ready": False,
+                "deleted": True,
+                "runtime_name": name,
+                "mock": True,
+                "remote_verified": True,
+            }
+        return {
+            "ready": False,
+            "deleted": False,
+            "allocation_unknown": True,
+            "runtime_name": name,
+            "mock": True,
+            "remote_verified": False,
+        }
 
     def delete(self, handle: dict) -> bool:
+        """Delete a verified mock runtime and return True only after tombstone + deletion record exist."""
         self._verify_handle(handle)
         self.delete_calls += 1
         if self.delete_calls <= self.fail_delete_times:
@@ -201,12 +238,12 @@ class MockColabProvider:
         if name not in self._deleted:
             self._deleted.add(name)
             self.deleted.append(name)
-        record=self._runtimes.pop(name, None)
+        record = self._runtimes.pop(name, None)
         if record:
-            self._tombstones[name]=record
+            self._tombstones[name] = record
         from .mock_sessions import MockWorkerSessions
         MockWorkerSessions.close(name)
-        return True
+        return bool(name in self._deleted and name in self._tombstones and name not in self._runtimes)
 
 
 class MockGPUExecutor:
@@ -253,10 +290,18 @@ class MockGPUExecutor:
         from .mock_sessions import MockWorkerSessions
         session = MockWorkerSessions.start(handle.get('runtime_name'), job.get('owner_id'),
                                            job.get('compatibility_signature'), execution_id)
+        from .runtime_worker import compute_manifest_warm_fingerprint
+
+        snapshot = job.get("snapshot") if isinstance(job.get("snapshot"), dict) else {}
+        manifest = snapshot.get("manifest") if isinstance(snapshot.get("manifest"), dict) else None
+        python_mm = f"{sys.version_info.major}.{sys.version_info.minor}"
+        warm_fp = compute_manifest_warm_fingerprint(manifest, python_mm=python_mm) if manifest is not None else None
         self._executions[execution_id] = {
             "signature": job.get('compatibility_signature'),
+            "warm_fingerprint": warm_fp or job.get("compatibility_signature"),
             "worker_session_id": session['id'],
             "restore_skipped": bool(session['restore_skipped'].get(execution_id)),
+            "warm_epoch_id": uuid.uuid4().hex,
             "runtime": handle.get('runtime_name'),
             "owner_id": job.get('owner_id'),
             "remaining": self.polls_before_complete,
@@ -270,30 +315,47 @@ class MockGPUExecutor:
 
     def poll(self, handle: dict, job: dict) -> dict:
         self.poll_calls += 1
-        state = self._executions.get(job.get("execution_id"))
+        execution_id = job.get("execution_id")
+        state = self._executions.get(execution_id)
         if state is None:
             raise ComputeError("mock execution is not recoverable")
         if state.get('owner_id') != job.get('owner_id') or state.get('runtime') != handle.get('runtime_name'):
             raise ComputeError('mock execution owner or runtime mismatch')
         from .mock_sessions import MockWorkerSessions
-        MockWorkerSessions.validate_poll(state['runtime'],state['owner_id'],job['execution_id'])
+        MockWorkerSessions.validate_poll(state['runtime'], state['owner_id'], job['execution_id'])
+        runtime_meta = {"python_mm": f"{sys.version_info.major}.{sys.version_info.minor}", "mock": True}
         if self.fail_on_poll:
             state["failed"] = True
         if state["failed"]:
             from .mock_sessions import MockWorkerSessions
-            MockWorkerSessions.finish(state['runtime'],state['owner_id'],job['execution_id'])
+            MockWorkerSessions.finish(state['runtime'], state['owner_id'], job['execution_id'])
             self._active = max(0, self._active - 1)
             return {
+                "execution_id": execution_id,
                 "state": "failed",
                 "outputs": [],
                 "error_code": "gpu_execution_failed",
                 "message": "mock executor failure",
+                "worker_reported_execution_id": execution_id,
+                "warm_saved": False,
+                "warm_epoch_id": None,
+                "warm_fingerprint": None,
+                "runtime_meta": runtime_meta,
             }
         if state["remaining"] > 0:
             state["remaining"] -= 1
-            return {"state": "running", "outputs": []}
+            return {
+                "execution_id": execution_id,
+                "state": "running",
+                "outputs": [],
+                "worker_reported_execution_id": execution_id,
+                "warm_saved": None,
+                "warm_epoch_id": None,
+                "warm_fingerprint": None,
+                "runtime_meta": runtime_meta,
+            }
         from .mock_sessions import MockWorkerSessions
-        MockWorkerSessions.finish(state['runtime'],state['owner_id'],job['execution_id'])
+        MockWorkerSessions.finish(state['runtime'], state['owner_id'], job['execution_id'])
         self._active = max(0, self._active - 1)
         output = {
             "filename": "mock-output.png",
@@ -303,7 +365,17 @@ class MockGPUExecutor:
         }
         self.outputs.append(output)
         timings = {"warm_reuse": 0.0} if state.get("restore_skipped") else {"restore_weights": 0.0}
-        return {"state": "completed", "outputs": [output], "timings": timings}
+        return {
+            "execution_id": execution_id,
+            "state": "completed",
+            "outputs": [output],
+            "timings": timings,
+            "worker_reported_execution_id": execution_id,
+            "warm_saved": True,
+            "warm_epoch_id": state["warm_epoch_id"],
+            "warm_fingerprint": state.get("warm_fingerprint") or state.get("signature") or "mock-warm-fingerprint",
+            "runtime_meta": runtime_meta,
+        }
 
 
 class DisabledProvider:

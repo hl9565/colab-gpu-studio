@@ -16,8 +16,26 @@ SIG = "sig"
 
 def two_jobs(provider="colab"):
     repo = Repository(Store("sqlite:///:memory:"))
-    jobs = [{"project_id": "p", "snapshot": {"manifest": {}}, "execution_policy": {"provider": provider}}
-            for _ in range(2)]
+    snapshot = {
+        "manifest": {
+            "workflow_key": "minimax-h3-ref2v",
+            "version": "1.4.0",
+            "modality": "video",
+            "compute_spec": {"accelerator": "L4"},
+        },
+        "resolved_params": {"width": 544, "height": 960, "length": 124, "mode": "fast8"},
+    }
+    jobs = [
+        {
+            "project_id": "p",
+            "workflow_key": "minimax-h3-ref2v",
+            "workflow_version": "1.4.0",
+            "gpu_tier": "L4",
+            "snapshot": snapshot,
+            "execution_policy": {"provider": provider},
+        }
+        for _ in range(2)
+    ]
     repo.create_batch("u", jobs, "k", {"mode": "batch"})
     first, second = sorted(repo.list("jobs", "u"), key=lambda j: j["queue_order"])
     return repo, first, second
