@@ -1,5 +1,6 @@
 """Server-verified object manifests become private, idempotent gallery assets."""
 
+import hashlib
 import json
 import time
 
@@ -8,6 +9,25 @@ from PIL import Image
 from app.config import settings
 
 from .artifacts import ArtifactError, LocalArtifactStore
+
+
+def build_result_metadata(job: dict) -> dict:
+    snapshot = job.get("snapshot") if isinstance(job.get("snapshot"), dict) else {}
+    raw = json.dumps(
+        snapshot, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str
+    ).encode()
+    return {
+        "job_id": job["id"],
+        "snapshot_sha256": snapshot.get("workflow_sha256") or hashlib.sha256(raw).hexdigest(),
+        "workflow_key": job.get("workflow_key"),
+        "workflow_version": job.get("workflow_version"),
+        "model_id": job.get("model_id"),
+        "model_revision": snapshot.get("model_revision"),
+        "resolved_params": snapshot.get("resolved_params", {}),
+        "system_smoke": snapshot.get("system_smoke") is True,
+        "gpu_reported": job.get("gpu_reported"),
+        "gpu_diagnostics": job.get("gpu_diagnostics"),
+    }
 
 
 def verify_output(job, item):

@@ -2,15 +2,55 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import uuid
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Protocol
 
 
 class ComputeError(RuntimeError):
     """Safe, user-facing compute failure."""
+
+
+def spec_key(spec: dict) -> str | None:
+    """Colab runtimespecs are identified by their ``key`` (variant/accelerator/shape)."""
+    value = spec.get("key")
+    if isinstance(value, dict):
+        return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return value or None
+
+
+def has_gpu_spec(spec: dict) -> bool:
+    key = spec.get("key")
+    return isinstance(key, dict) and key.get("variant") in {"GPU", "VARIANT_GPU"}
+
+
+def select_compute_spec(job: dict, specs: Iterable[dict], *, prep_spec_key: dict | None = None) -> dict:
+    requested = job.get("requested_spec") or (job.get("execution_policy") or {}).get("requested_spec")
+    requested_key = requested if isinstance(requested, str) else spec_key(requested or {})
+    snapshot = job.get("snapshot") or {}
+    smoke = snapshot.get("system_smoke") is True
+    prep = snapshot.get("prep") is True
+    reviewed_key = spec_key({"key": (snapshot.get("manifest") or {}).get("compute_spec")})
+    if prep:
+        requested_key = reviewed_key = spec_key({"key": prep_spec_key})
+    if requested_key is None:
+        requested_key = reviewed_key
+    if not (smoke or snapshot.get("workflow_smoke") is True or reviewed_key is not None):
+        raise ComputeError("没有符合工作流runtime的GPU规格")
+    if smoke and requested_key is None:
+        raise ComputeError("system smoke必须绑定已选择的GPU规格")
+    if prep and requested_key is None:
+        raise ComputeError("没有符合工作流runtime的GPU规格")
+    for spec in specs:
+        if spec.get("eligible") is not True or has_gpu_spec(spec) == prep:
+            continue
+        if requested_key is None or spec_key(spec) == requested_key:
+            return spec
+    raise ComputeError("没有符合工作流runtime的GPU规格")
 
 
 class ProviderUnavailable(ComputeError):

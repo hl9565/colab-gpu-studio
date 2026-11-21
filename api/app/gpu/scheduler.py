@@ -22,6 +22,9 @@ from .compute import (
     ProviderUnavailable,
     default_executor_factory,
     default_provider_factory,
+    has_gpu_spec,
+    select_compute_spec,
+    spec_key,
 )
 from .estimator import check_job_reuse_guard, min_deadlines
 from .google import GoogleError
@@ -1374,45 +1377,18 @@ class Scheduler:
 
     @staticmethod
     def _spec_key(spec: dict) -> str | None:
-        """Colab runtimespecs are identified by their ``key`` (variant/accelerator/shape)."""
-        value = spec.get("key")
-        if isinstance(value, dict):
-            return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-        return value or None
+        return spec_key(spec)
 
     @staticmethod
     def _has_gpu(spec: dict) -> bool:
-        key = spec.get("key")
-        return isinstance(key, dict) and key.get("variant") in {"GPU", "VARIANT_GPU"}
+        return has_gpu_spec(spec)
 
     def _select_spec(self, job: dict, provider: Any) -> dict:
         try:
             specs = provider.list_specs()
         except Exception as exc:
             raise ComputeError(self._safe_error(exc)) from exc
-        requested = job.get("requested_spec") or (job.get("execution_policy") or {}).get("requested_spec")
-        requested_key = requested if isinstance(requested, str) else self._spec_key(requested or {})
-        snapshot = job.get("snapshot") or {}
-        smoke = snapshot.get("system_smoke") is True
-        prep = snapshot.get("prep") is True
-        # 官方 runtimespecs 只返回 key(variant/accelerator/shape)。经审查的工作流在
-        # manifest.compute_spec 写明已验证过的规格；普通任务只允许这个规格，
-        # 管理员冒烟任务按其请求的规格运行，缓存准备只用固定的 CPU 规格。
-        reviewed_key = self._spec_key({"key": (snapshot.get("manifest") or {}).get("compute_spec")})
-        if prep:
-            requested_key = reviewed_key = self._spec_key({"key": PREP_SPEC_KEY})
-        if requested_key is None:
-            requested_key = reviewed_key
-        if not (smoke or snapshot.get("workflow_smoke") is True or reviewed_key is not None):
-            raise ComputeError("没有符合工作流runtime的GPU规格")
-        if smoke and requested_key is None:
-            raise ComputeError("system smoke必须绑定已选择的GPU规格")
-        for spec in specs:
-            if spec.get("eligible") is not True or self._has_gpu(spec) == prep:
-                continue
-            if requested_key is None or self._spec_key(spec) == requested_key:
-                return spec
-        raise ComputeError("没有符合工作流runtime的GPU规格")
+        return select_compute_spec(job, specs, prep_spec_key=PREP_SPEC_KEY)
 
     def _mark_lease_unknown(
         self,
@@ -3346,22 +3322,9 @@ class Scheduler:
         )
 
     def _result_metadata(self, job: dict) -> dict:
-        snapshot = job.get("snapshot") if isinstance(job.get("snapshot"), dict) else {}
-        raw = json.dumps(
-            snapshot, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str
-        ).encode()
-        return {
-            "job_id": job["id"],
-            "snapshot_sha256": snapshot.get("workflow_sha256") or hashlib.sha256(raw).hexdigest(),
-            "workflow_key": job.get("workflow_key"),
-            "workflow_version": job.get("workflow_version"),
-            "model_id": job.get("model_id"),
-            "model_revision": snapshot.get("model_revision"),
-            "resolved_params": snapshot.get("resolved_params", {}),
-            "system_smoke": snapshot.get("system_smoke") is True,
-            "gpu_reported": job.get("gpu_reported"),
-            "gpu_diagnostics": job.get("gpu_diagnostics"),
-        }
+        from .output_protocol import build_result_metadata
+
+        return build_result_metadata(job)
 
     def _write_local_metadata(self, job: dict, metadata: dict) -> dict:
         from app.config import settings
