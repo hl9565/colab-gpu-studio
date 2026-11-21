@@ -239,3 +239,126 @@ def row_has_positive_usage(row: object) -> bool:
         except (TypeError, ValueError):
             continue
     return False
+
+
+def retarget_handle(handle, job_id):
+    """Return the runtime handle re-owned by job_id (providers check handle ownership against the lease owner)."""
+    return {**handle, 'job_id': job_id, 'owner_job_id': job_id}
+
+
+def extract_tunnel_endpoint(obj: object) -> str | None:
+    """Extract normalized tunnel endpoint from a row, mapping, or nested handle/data dict."""
+    if obj is None:
+        return None
+    candidates: list[object] = []
+    if isinstance(obj, Mapping):
+        candidates.extend((obj.get("tunnel_endpoint"), obj.get("endpoint")))
+        data = obj.get("data") if isinstance(obj.get("data"), Mapping) else None
+        if data is not None:
+            candidates.extend((data.get("tunnel_endpoint"), data.get("endpoint")))
+        for h in (obj.get("handle"), data.get("handle") if data is not None else None):
+            if isinstance(h, Mapping):
+                candidates.extend((h.get("tunnel_endpoint"), h.get("endpoint")))
+    else:
+        data = getattr(obj, "data", None)
+        candidates.extend((getattr(obj, "tunnel_endpoint", None), getattr(obj, "endpoint", None)))
+        if isinstance(data, Mapping):
+            candidates.extend((data.get("tunnel_endpoint"), data.get("endpoint")))
+            h = data.get("handle")
+            if isinstance(h, Mapping):
+                candidates.extend((h.get("tunnel_endpoint"), h.get("endpoint")))
+    for cand in candidates:
+        norm = normalize_tunnel_endpoint(cand)
+        if norm:
+            return norm
+    return None
+
+
+def extract_runtime_id(obj: object) -> str | None:
+    """Extract runtime_id (or runtime_id from `runtimes/<id>`) from a row, mapping, or nested handle/data dict."""
+    if obj is None:
+        return None
+    if isinstance(obj, Mapping):
+        data = obj.get("data") if isinstance(obj.get("data"), Mapping) else None
+        candidates: list[object] = [obj.get("runtime_id")]
+        if data is not None:
+            candidates.append(data.get("runtime_id"))
+        handle = obj.get("handle")
+        if not isinstance(handle, Mapping) and data is not None:
+            handle = data.get("handle")
+        if isinstance(handle, Mapping):
+            candidates.append(handle.get("runtime_id"))
+        for raw in candidates:
+            if isinstance(raw, str) and raw.strip():
+                return raw.strip()
+        name_candidates: list[object] = [obj.get("runtime_name")]
+        if data is not None:
+            name_candidates.append(data.get("runtime_name"))
+        if isinstance(handle, Mapping):
+            name_candidates.append(handle.get("runtime_name"))
+        for raw_name in name_candidates:
+            extracted = extract_runtime_name_id(raw_name)
+            if extracted:
+                return extracted
+        return None
+    data = getattr(obj, "data", None)
+    candidates = [getattr(obj, "runtime_id", None)]
+    if isinstance(data, Mapping):
+        candidates.append(data.get("runtime_id"))
+        if isinstance(data.get("handle"), Mapping):
+            candidates.append(data["handle"].get("runtime_id"))
+    for raw in candidates:
+        if isinstance(raw, str) and raw.strip():
+            return raw.strip()
+    name_candidates = [getattr(obj, "runtime_name", None)]
+    if isinstance(data, Mapping):
+        name_candidates.append(data.get("runtime_name"))
+        if isinstance(data.get("handle"), Mapping):
+            name_candidates.append(data["handle"].get("runtime_name"))
+    for raw_name in name_candidates:
+        extracted = extract_runtime_name_id(raw_name)
+        if extracted:
+            return extracted
+    return None
+
+
+def collect_runtime_identities(obj: object, runtime_ids: set[str], endpoints: set[str]) -> None:
+    """Collect runtime_id, runtimes/<id>, and normalized tunnel_endpoint from one object and nested handle/data."""
+    if obj is None:
+        return
+
+    def _scan_mapping(m: Mapping[str, object], *, recurse: bool) -> None:
+        rt_id = m.get("runtime_id")
+        if isinstance(rt_id, str) and rt_id.strip():
+            runtime_ids.add(rt_id.strip())
+        name_rt = extract_runtime_name_id(m.get("runtime_name"))
+        if name_rt:
+            runtime_ids.add(name_rt)
+        for ep_key in ("tunnel_endpoint", "endpoint"):
+            ep = normalize_tunnel_endpoint(m.get(ep_key))
+            if ep:
+                endpoints.add(ep)
+        if recurse:
+            handle = m.get("handle")
+            if isinstance(handle, Mapping):
+                _scan_mapping(handle, recurse=False)
+            data = m.get("data")
+            if isinstance(data, Mapping):
+                _scan_mapping(data, recurse=True)
+
+    if isinstance(obj, Mapping):
+        _scan_mapping(obj, recurse=True)
+        return
+    rt_id = getattr(obj, "runtime_id", None)
+    if isinstance(rt_id, str) and rt_id.strip():
+        runtime_ids.add(rt_id.strip())
+    name_rt = extract_runtime_name_id(getattr(obj, "runtime_name", None))
+    if name_rt:
+        runtime_ids.add(name_rt)
+    for attr in ("tunnel_endpoint", "endpoint"):
+        ep = normalize_tunnel_endpoint(getattr(obj, attr, None))
+        if ep:
+            endpoints.add(ep)
+    data = getattr(obj, "data", None)
+    if isinstance(data, Mapping):
+        _scan_mapping(data, recurse=True)
