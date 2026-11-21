@@ -6,10 +6,10 @@ import { join } from 'node:path';
 const root = join(process.cwd(), 'src');
 const read = (name) => readFileSync(join(root, name), 'utf8');
 
-test('App owns one runtime choice and polls account/instance resources', () => {
+test('App owns one runtime choice and delegates account/instance polling', () => {
   const source = read('App.tsx');
   assert.match(source, /runtimeChoice/);
-  assert.match(source, /getGpuAccounts|getGpuInstances|apiFetch/);
+  assert.match(source, /useStudioResources\(loggedIn\)/);
   assert.match(source, /execution_policy/);
   assert.match(source, /retain_idle_minutes/);
   assert.doesNotMatch(source, /shutdown_after_job/);

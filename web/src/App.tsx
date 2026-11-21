@@ -8,7 +8,7 @@ import { Sparkles, Zap, Image as ImageIcon, Cpu, Settings as SettingsIcon, Folde
 import {
   apiMessage, assetUrl, cancelGpuJob, createGpuJob, createGpuBatch, createProject, deleteAsset, disconnectGoogle,
   apiFetch,
-  getGpuComputeSpecs, getGpuGallery, getGpuJob, getGpuJobs, getGpuModels, listGpuInstances,
+  getGpuComputeSpecs, getGpuGallery, getGpuJob, getGpuModels,
   getGpuPresets, getReferenceAssets, getGpuSettings, getGpuUsage, getGpuWorkflowSchema, getGpuWorkflows, getProjects, importGpuWorkflow,
   isLoggedIn, login, publishGpuWorkflow, retryGpuJob, retryGpuAttempt, startGoogleAuth, stopGpuCompute, updateAsset, uploadAsset,
   validateGpuWorkflow, rollbackGpuWorkflow, deactivateGpuWorkflow, saveGpuPreset, ApiError, type ComputeSpec, type GalleryAsset, type GpuJob, type GpuPreset,
@@ -28,6 +28,8 @@ import { projectOptionLabel } from './lib/project-label';
 import { carriedDraft, mergeWorkflowDraft, readWorkflowDraft, writeWorkflowDraft } from './lib/workflow-draft';
 import { formatInstanceTime } from './lib/instance-time';
 import { JobHistoryDetails } from './components/JobHistoryDetails';
+import { uniqueBy, useStudioResources } from './hooks/useStudioResources';
+import { useProjectJobs } from './hooks/useProjectJobs';
 import styles from './gpu.module.css';
 
 const tabs = ['创作', '任务', '作品', '算力'] as const;
@@ -36,16 +38,6 @@ const terminalStates = new Set(['completed', 'succeeded', 'failed', 'failed_fina
 
 function record(value: unknown): value is Record<string, unknown> {
   return Boolean(value && typeof value === 'object' && !Array.isArray(value));
-}
-
-function uniqueBy<T>(items: T[], keyOf: (item: T) => string): T[] {
-  const seen = new Set<string>();
-  return items.filter((item) => {
-    const key = keyOf(item);
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
 }
 
 function instanceIdOf(instance: Pick<GpuInstance, 'id' | 'instance_id'>): string {
@@ -234,24 +226,20 @@ export default function App() {
   const [params, setParams] = useState<Record<string, unknown>>({});
   const [gallery, setGallery] = useState<GalleryAsset[]>([]);
   const [referenceImages, setReferenceImages] = useState<GalleryAsset[]>([]);
-  const [jobs, setJobs] = useState<GpuJob[]>([]);
+  const { jobs, setJobs, refreshingJobs, jobError, setJobError, refreshJobs } = useProjectJobs(projectId, loggedIn);
   const [selectedAssets, setSelectedAssets] = useState<string[]>([]);
   const [runtime, setRuntime] = useState<Provider>('mock');
   const [maxRuntime, setMaxRuntime] = useState(30);
   const [batchCount,setBatchCount] = useState(1);
   const [batchMode,setBatchMode] = useState<'save'|'smart'|'batch'|'retain'>('save');
   const [runtimeChoice, setRuntimeChoice] = useState<RuntimeChoice>({ accountId: '', instanceId: '', lifecycle: 'save', retainIdleMinutes: 15 });
-  const [accounts, setAccounts] = useState<GpuAccount[]>([]);
-  const [instances, setInstances] = useState<GpuInstance[]>([]);
-  const [resourceError, setResourceError] = useState('');
-  const resourceRefresh = useRef<(() => void) | null>(null);
+  const { accounts, setAccounts, instances, setInstances, refreshResources } = useStudioResources(loggedIn);
   const submitting = useRef(false);
   const [settings, setSettings] = useState<GpuSettings | null>(null);
   const [usage, setUsage] = useState<GpuUsage | null>(null);
   const [specs, setSpecs] = useState<ComputeSpec[]>([]);
   const [specsNote, setSpecsNote] = useState('');
   const [error, setError] = useState('');
-  const [jobError, setJobError] = useState('');
   const [loading, setLoading] = useState('');
   const [uploadProgress, setUploadProgress] = useState<Record<string, number>>({});
   const [confirm, setConfirm] = useState<'submit' | 'stop' | null>(null);
@@ -259,11 +247,9 @@ export default function App() {
   const [viewer, setViewer] = useState<GalleryAsset | null>(null);
   const [againJob, setAgainJob] = useState<GpuJob | null>(null);
   const [loginRefresh, setLoginRefresh] = useState(0);
-  const [refreshingJobs, setRefreshingJobs] = useState(false);
   const idempotencyKey = useRef('');
   const retryKeys = useRef<Record<string, string>>({});
   const instanceRetentionKeys = useRef<Record<string, string>>({});
-  const jobSequence = useRef(0);
   const draftReady = useRef('');
   const paramsRef = useRef(params);
   paramsRef.current = params;
@@ -330,31 +316,6 @@ export default function App() {
   }, [loggedIn, loginRefresh]);
 
   useEffect(() => {
-    if (!loggedIn) return;
-    let alive = true;
-    const refreshResources = async () => {
-      try {
-        const [accountResult, instanceResult] = await Promise.all([
-          apiFetch<unknown>('/api/gpu/accounts'),
-          listGpuInstances(),
-        ]);
-        if (!alive) return;
-        const nextAccounts = (Array.isArray(accountResult) ? accountResult : record(accountResult) && Array.isArray(accountResult.data) ? accountResult.data : []) as GpuAccount[];
-        const nextInstances = instanceResult as unknown as GpuInstance[];
-        setAccounts(uniqueBy(nextAccounts, (account) => account.account_id));
-        setInstances(uniqueBy(nextInstances, (instance) => instanceIdOf(instance)));
-        setResourceError('');
-      } catch (cause) {
-        if (alive) setResourceError(`账号/实例：${apiMessage(cause)}`);
-      }
-    };
-    resourceRefresh.current = () => void refreshResources();
-    void refreshResources();
-    const timer = window.setInterval(() => void refreshResources(), 5000);
-    return () => { alive = false; resourceRefresh.current = null; window.clearInterval(timer); };
-  }, [loggedIn]);
-
-  useEffect(() => {
     if (!modelId) return;
     const allowed = workflows.filter((w) => w.model_id === modelId);
     if (workflowId && !allowed.some((w) => w.id === workflowId)) {
@@ -395,32 +356,6 @@ export default function App() {
     if (draftReady.current !== `${projectId}:${workflowId}` || !workflowId || !projectId) return;
     writeWorkflowDraft(projectId, workflowId, params);
   }, [params, projectId, workflowId]);
-
-  useEffect(() => {
-    if (!projectId || !loggedIn) return;
-    let alive = true;
-    const refresh = async () => {
-      const seq = ++jobSequence.current;
-      setRefreshingJobs(true);
-      try {
-        const next = await getGpuJobs(projectId);
-        if (!alive || seq !== jobSequence.current) return;
-        setJobs(next.filter((j) => j.project_id === projectId));
-        setJobError('');
-      } catch (cause) {
-        if (alive && seq === jobSequence.current) setJobError(apiMessage(cause));
-      } finally {
-        if (alive && seq === jobSequence.current) setRefreshingJobs(false);
-      }
-    };
-    void refresh();
-    const timer = window.setInterval(() => void refresh(), 4000);
-    return () => {
-      alive = false;
-      window.clearInterval(timer);
-      ++jobSequence.current;
-    };
-  }, [projectId, loggedIn]);
 
   useEffect(() => {
     setReferenceImages([]);
@@ -475,19 +410,6 @@ export default function App() {
     } catch (cause) {
       setError(apiMessage(cause));
       return false;
-    }
-  }
-
-  async function refreshJobs() {
-    if (!projectId) return;
-    setRefreshingJobs(true);
-    try {
-      setJobs((await getGpuJobs(projectId)).filter((j) => j.project_id === projectId));
-      setJobError('');
-    } catch (cause) {
-      setJobError(apiMessage(cause));
-    } finally {
-      setRefreshingJobs(false);
     }
   }
 
@@ -922,7 +844,7 @@ export default function App() {
             instances={instances}
             onContinue={continueInstance}
             onOpenWorkbench={openInstanceWorkbench}
-            onRefreshInstances={() => resourceRefresh.current?.()}
+            onRefreshInstances={() => void refreshResources()}
             onStop={() => setConfirm('stop')}
             onCheck={() => void checkGpu()}
             loadingStop={loading === 'stop'}
@@ -937,7 +859,7 @@ export default function App() {
             accounts={accounts}
             onAccountsChange={setAccounts}
             instances={instances}
-            onRefreshInstances={() => resourceRefresh.current?.()}
+            onRefreshInstances={() => void refreshResources()}
             settings={settings}
             usage={usage}
             specs={specs}
