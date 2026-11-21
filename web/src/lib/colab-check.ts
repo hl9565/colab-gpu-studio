@@ -5,14 +5,20 @@ type ColabAccount = {
   enabled?: boolean;
   status?: string;
   allow_allocation?: boolean;
-  authorization?: { colab?: { connected?: boolean } };
+  authorization?: { colab?: { connected?: boolean; message?: string } };
   colab?: { connected?: boolean; status?: string };
   colab_status?: string;
 };
 
 export type GpuCheckRequest =
   | { provider: 'colab'; accountId: string }
+  | { provider: 'reauth'; accountId: string; message: string }
   | { provider: 'mock'; accountId: null; reason: 'offline' | 'real_disabled' | 'account_unavailable' };
+
+function colabReauthMessage(account: ColabAccount): string | undefined {
+  const colab = account.authorization?.colab;
+  if (account.enabled !== false && colab?.connected === false && colab.message) return colab.message;
+}
 
 function colabConnected(account: ColabAccount): boolean {
   return account.authorization?.colab?.connected === true
@@ -26,7 +32,7 @@ export function isColabAccountQueryable(account: ColabAccount): boolean {
   // `status` can describe the account's other OAuth/Drive state.  The Colab
   // discovery endpoint is read-only, so allocation permission and that pool
   // status must not turn a connected Colab account into a mock result.
-  return account.enabled !== false && colabConnected(account);
+  return account.enabled !== false && !colabReauthMessage(account) && colabConnected(account);
 }
 
 /** A real job/smoke also needs the explicit account-pool allocation switch. */
@@ -56,10 +62,15 @@ export function resolveGpuCheckRequest(
   const account = selectedAccountId
     ? accounts.find((item) => item.account_id === selectedAccountId)
     : accounts.find(predicate);
-  if (!account || !predicate(account)) {
-    return { provider: 'mock', accountId: null, reason: 'account_unavailable' };
+  if (account && predicate(account)) {
+    return { provider: 'colab', accountId: account.account_id };
   }
-  return { provider: 'colab', accountId: account.account_id };
+  const reauth = selectedAccountId ? account : accounts.find(colabReauthMessage);
+  const message = reauth && colabReauthMessage(reauth);
+  if (reauth && message) {
+    return { provider: 'reauth', accountId: reauth.account_id, message };
+  }
+  return { provider: 'mock', accountId: null, reason: 'account_unavailable' };
 }
 
 /** Keep the complete official spec object; never stringify its structured key. */

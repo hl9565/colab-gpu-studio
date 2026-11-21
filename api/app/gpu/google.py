@@ -39,6 +39,13 @@ class GoogleOAuthError(GoogleError):
     pass
 
 
+class GoogleTransientError(GoogleError):
+    pass
+
+
+_REAUTH_MESSAGE = "Google 授权已失效，请重新授权"
+_UNUSABLE_CREDENTIAL_MESSAGE = "Google OAuth凭证不可用，请重新授权"
+_INVALID_REFRESH_RESPONSE = "Google OAuth刷新响应异常，请稍后重试"
 _PURPOSES = {
     "colab": "https://www.googleapis.com/auth/colaboratory",
     "drive": "https://www.googleapis.com/auth/drive.file",
@@ -212,16 +219,31 @@ class GoogleService:
         ]
         return rows[0] if rows else None
 
+    def _update_refresh_credential(self, credential: dict, expected_version: int | None, patch: dict) -> dict | None:
+        update_if_version = getattr(self.store, "update_credential_if_version", None)
+        if callable(update_if_version):
+            return update_if_version(self.owner_id, credential["id"], expected_version, patch)
+        return self._update("credentials", credential["id"], patch, self.owner_id)
+
+    @staticmethod
+    def _decrypt_tokens(credential: dict) -> tuple[str, str]:
+        access = credential.get("encrypted_access_token")
+        refresh = credential.get("encrypted_refresh_token")
+        if not isinstance(access, str) or not access or not isinstance(refresh, str) or not refresh:
+            raise ValueError(_UNUSABLE_CREDENTIAL_MESSAGE)
+        return decrypt_secret(access), decrypt_secret(refresh)
+
     def status(self) -> dict:
         configured = all(self._config_value())
         result: dict[str, dict[str, Any]] = {}
         for purpose in _PURPOSES:
             credential = self._credential(purpose, account_id=self.account_id)
             scope_ok = bool(credential and self._scope_sufficient(purpose, credential.get("scope")))
-            connected = bool(credential and credential.get("encrypted_refresh_token") and scope_ok)
+            reauth_required = bool(credential and credential.get("reauth_required") is True)
+            connected = bool(credential and credential.get("encrypted_refresh_token") and scope_ok and not reauth_required)
             cred_configured = bool(
                 credential
-                and str(credential.get("client_id", "")).strip()
+                and str(credential.get("client_id") or "").strip()
                 and credential.get("encrypted_client_secret")
             )
             result[purpose] = {
@@ -229,7 +251,9 @@ class GoogleService:
                 "configured": configured or cred_configured,
                 "expires_at": credential.get("expires_at") if credential else None,
             }
-            if credential and not scope_ok:
+            if credential and reauth_required:
+                result[purpose]["message"] = str(credential.get("reauth_message") or _REAUTH_MESSAGE)
+            elif credential and not scope_ok:
                 result[purpose]["message"] = "Google权限不足，请重新授权"
         return result
 
@@ -367,10 +391,14 @@ class GoogleService:
             raise GoogleOAuthError("Google OAuth响应无效")
         old = self._credential(row.get("oauth_purpose"), row.get("owner_id"), row.get("account_id"))
         if not refresh and old:
-            try:
-                refresh = decrypt_secret(old["encrypted_refresh_token"])
-            except (KeyError, TypeError, ValueError):
-                refresh = None
+            if old.get("reauth_required") is True:
+                raise GoogleOAuthError("Google OAuth未返回可持久化刷新凭证，请重新授权")
+            old_refresh = old.get("encrypted_refresh_token")
+            if isinstance(old_refresh, str) and old_refresh:
+                try:
+                    refresh = decrypt_secret(old_refresh)
+                except ValueError:
+                    refresh = None
         if not refresh:
             raise GoogleOAuthError("Google OAuth未返回可持久化刷新凭证")
         data = {
@@ -381,6 +409,10 @@ class GoogleService:
             "expires_at": self.clock() + max(0, expires_in - 60),
             "scope": payload.get("scope", _PURPOSES[row["oauth_purpose"]]),
             "token_type": payload.get("token_type", "Bearer"),
+            "reauth_required": False,
+            "reauth_message": None,
+            "client_id": None,
+            "encrypted_client_secret": None,
             **({"account_id": row.get("account_id")} if row.get("account_id") is not None else {}),
         }
         if old:
@@ -401,16 +433,21 @@ class GoogleService:
         credential = self._credential(purpose, account_id=self.account_id)
         if not credential:
             raise GoogleOAuthError("Google OAuth未连接，真实GPU能力已关闭")
+        expected_version = credential.get("version")
+        if credential.get("reauth_required") is True:
+            raise GoogleOAuthError(str(credential.get("reauth_message") or _REAUTH_MESSAGE))
         if not self._scope_sufficient(purpose, credential.get("scope")):
             raise GoogleOAuthError("Google OAuth权限不足，请重新授权")
         try:
-            access = decrypt_secret(credential["encrypted_access_token"])
-            refresh = decrypt_secret(credential["encrypted_refresh_token"])
-        except (KeyError, ValueError) as exc:
-            raise GoogleOAuthError("Google OAuth凭证不可用") from exc
+            access, refresh = self._decrypt_tokens(credential)
+        except ValueError as exc:
+            self._update_refresh_credential(credential, expected_version, {
+                "reauth_required": True, "reauth_message": _UNUSABLE_CREDENTIAL_MESSAGE,
+            })
+            raise GoogleOAuthError(_UNUSABLE_CREDENTIAL_MESSAGE) from exc
         if float(credential.get("expires_at", 0)) > self.clock() + 60:
             return access
-        cred_client_id = str(credential.get("client_id", "")).strip()
+        cred_client_id = str(credential.get("client_id") or "").strip()
         if cred_client_id and credential.get("encrypted_client_secret"):
             try:
                 client_id = cred_client_id
@@ -430,31 +467,70 @@ class GoogleService:
                 },
             )
         except httpx.HTTPError as exc:
-            raise GoogleOAuthError("Google OAuth刷新失败") from exc
-        if response.status_code < 200 or response.status_code >= 300:
-            raise GoogleOAuthError("Google OAuth刷新失败")
+            raise GoogleTransientError("Google OAuth刷新网络异常，请稍后重试") from exc
+        status = response.status_code
+        if status == 429 or status >= 500:
+            raise GoogleTransientError("Google OAuth服务暂时不可用，请稍后重试")
+        if not 200 <= status < 300:
+            oauth_error = None
+            if status == 400:
+                try:
+                    payload = response.json()
+                except ValueError as exc:
+                    raise GoogleTransientError(_INVALID_REFRESH_RESPONSE) from exc
+                if isinstance(payload, dict):
+                    oauth_error = payload.get("error")
+            if oauth_error in ("invalid_client", "unauthorized_client"):
+                message = "Google OAuth客户端配置不可用，请检查配置并重新授权"
+            elif status == 401 or oauth_error == "invalid_grant":
+                message = _REAUTH_MESSAGE
+            else:
+                raise GoogleTransientError(_INVALID_REFRESH_RESPONSE)
+            self._update_refresh_credential(credential, expected_version, {
+                "reauth_required": True, "reauth_message": message,
+            })
+            raise GoogleOAuthError(message)
         try:
             payload = response.json()
             new_access = payload.get("access_token")
+            new_refresh = payload.get("refresh_token")
             expires_in = int(payload.get("expires_in", 3600))
-            if not isinstance(new_access, str) or not new_access:
+            if not isinstance(new_access, str) or not new_access or (
+                new_refresh is not None and not isinstance(new_refresh, str)
+            ):
                 raise ValueError
-        except (ValueError, TypeError, AttributeError):
-            raise GoogleOAuthError("Google OAuth刷新响应无效")
-        new_refresh = payload.get("refresh_token")
-        self._update(
-            "credentials",
-            credential["id"],
+        except (ValueError, TypeError, AttributeError, OverflowError) as exc:
+            raise GoogleTransientError(_INVALID_REFRESH_RESPONSE) from exc
+        updated = self._update_refresh_credential(
+            credential,
+            expected_version,
             {
                 "encrypted_access_token": encrypt_secret(new_access),
                 "encrypted_refresh_token": encrypt_secret(new_refresh)
                 if new_refresh
                 else credential["encrypted_refresh_token"],
                 "expires_at": self.clock() + max(0, expires_in - 60),
+                "reauth_required": False,
+                "reauth_message": None,
             },
-            self.owner_id,
         )
-        return new_access
+        if updated is not None:
+            return new_access
+
+        current = self._credential(purpose, account_id=self.account_id)
+        if not current:
+            raise GoogleOAuthError("Google OAuth未连接，真实GPU能力已关闭")
+        if current.get("reauth_required") is True:
+            raise GoogleOAuthError(str(current.get("reauth_message") or _REAUTH_MESSAGE))
+        if not self._scope_sufficient(purpose, current.get("scope")):
+            raise GoogleOAuthError("Google OAuth权限不足，请重新授权")
+        if float(current.get("expires_at", 0)) <= self.clock():
+            raise GoogleOAuthError(_REAUTH_MESSAGE)
+        try:
+            current_access, _refresh = self._decrypt_tokens(current)
+        except ValueError as exc:
+            raise GoogleOAuthError(_UNUSABLE_CREDENTIAL_MESSAGE) from exc
+        return current_access
 
     def disconnect(self, purpose: str) -> bool:
         if purpose not in _PURPOSES:
@@ -468,7 +544,7 @@ class GoogleService:
             token = refresh or decrypt_secret(credential.get("encrypted_access_token", ""))
             response = self.client.post(REVOKE_URL, data={"token": token})
             remote_confirmed = 200 <= response.status_code < 300
-        except (httpx.HTTPError, KeyError, TypeError, ValueError):
+        except (httpx.HTTPError, AttributeError, KeyError, TypeError, ValueError):
             # Do not include the token or upstream response body in any error.
             remote_confirmed = False
         # Remove local bearer material and keep a sanitized tombstone that records
@@ -481,6 +557,8 @@ class GoogleService:
                 "encrypted_access_token": None,
                 "encrypted_refresh_token": None,
                 "expires_at": 0,
+                "reauth_required": False,
+                "reauth_message": None,
                 "disconnect_remote_confirmed": remote_confirmed,
                 "disconnect_status": "confirmed" if remote_confirmed else "remote_unconfirmed",
             },
@@ -493,4 +571,4 @@ class GoogleService:
             self.client.close()
 
 
-__all__ = ["GoogleConfigurationError", "GoogleError", "GoogleOAuthError", "GoogleService"]
+__all__ = ["GoogleConfigurationError", "GoogleError", "GoogleOAuthError", "GoogleService", "GoogleTransientError"]

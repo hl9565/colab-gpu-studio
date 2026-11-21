@@ -1195,6 +1195,26 @@ class Repository:
             session.flush()
             return self._row(row)
 
+    def update_credential_if_version(
+        self, owner_id: str, credential_id: str, expected_version: int, patch: Mapping[str, object]
+    ) -> dict | None:
+        """Patch one live credential; SQLite needs a write transaction before the version read."""
+        with self.store.db_lock(), self.store.Session.begin() as session:
+            if self.store.engine.dialect.name == "sqlite":
+                session.execute(text("BEGIN IMMEDIATE"))
+            row = session.scalar(
+                select(GpuCredentialRow)
+                .where(GpuCredentialRow.id == credential_id, GpuCredentialRow.owner_id == owner_id)
+                .with_for_update()
+            )
+            if row is None or row.version != expected_version or (row.data or {}).get("revoked") is True:
+                return None
+            row.data = {**(row.data or {}), **copy.deepcopy(dict(patch))}
+            row.version += 1
+            row.updated_at = utcnow()
+            session.flush()
+            return self._row(row)
+
     def create_job(self, owner_id, body, idempotency_key, *, admitted=None):
         raw = copy.deepcopy(dict(body))
         body_hash = digest(raw)

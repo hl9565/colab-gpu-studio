@@ -26,7 +26,10 @@ const colabConnectedWithOtherStatus = {
   status: 'needs_reauth',
   enabled: true,
   allow_allocation: false,
-  authorization: { colab: { connected: true } },
+  authorization: {
+    colab: { connected: true },
+    drive: { connected: false, message: 'Drive 需重新授权' },
+  },
 };
 const disabled = {
   account_id: 'account-disabled',
@@ -43,6 +46,13 @@ const unauthorized = {
   enabled: true,
   allow_allocation: true,
   authorization: { colab: { connected: false } },
+};
+const needsColabReauth = {
+  ...unauthorized,
+  account_id: 'account-reauth',
+  status: 'connected',
+  colab_status: 'connected',
+  authorization: { colab: { connected: false, message: 'Colab 需重新授权' } },
 };
 
 const request = (settings = real, accounts = [], selectedAccountId = null) =>
@@ -75,6 +85,32 @@ test('explicit disabled or unauthorized account does not silently fail over', ()
   });
 });
 
+test('explicit Colab reauthorization does not fall back to mock or another account', () => {
+  assert.deepEqual(request(real, [connectedCli, needsColabReauth], 'account-reauth'), {
+    provider: 'reauth',
+    accountId: 'account-reauth',
+    message: 'Colab 需重新授权',
+  });
+});
+
+test('automatic pool prefers healthy Colab, then reports an enabled account needing reauthorization', () => {
+  const disabledReauth = { ...needsColabReauth, account_id: 'disabled-reauth', enabled: false };
+  assert.deepEqual(request(real, [disabledReauth, needsColabReauth, connectedCli]), {
+    provider: 'colab',
+    accountId: 'account-cli',
+  });
+  assert.deepEqual(request(real, [disabledReauth, needsColabReauth, unauthorized]), {
+    provider: 'reauth',
+    accountId: 'account-reauth',
+    message: 'Colab 需重新授权',
+  });
+  assert.deepEqual(request(real, [disabledReauth, unauthorized]), {
+    provider: 'mock',
+    accountId: null,
+    reason: 'account_unavailable',
+  });
+});
+
 test('legacy owner uses the migrated explicit account, not global settings.google', () => {
   const legacyGlobalSlot = { real_enabled: true, offline_mode: false, google: { colab: { connected: true } } };
   assert.deepEqual(request(legacyGlobalSlot, [connectedLegacyOwner]), {
@@ -83,20 +119,24 @@ test('legacy owner uses the migrated explicit account, not global settings.googl
   });
 });
 
-test('query only requires an enabled account with connected Colab, not allocation permission or pool status', () => {
+test('Drive-only reauthorization does not block a healthy Colab account', () => {
   assert.deepEqual(request(real, [colabConnectedWithOtherStatus]), {
+    provider: 'colab',
+    accountId: 'account-colab-only',
+  });
+  assert.deepEqual(request(real, [colabConnectedWithOtherStatus], 'account-colab-only'), {
     provider: 'colab',
     accountId: 'account-colab-only',
   });
 });
 
 test('offline mode and disabled real GPU always use mock without an accountId', () => {
-  assert.deepEqual(request({ real_enabled: true, offline_mode: true }, [connectedCli]), {
+  assert.deepEqual(request({ real_enabled: true, offline_mode: true }, [connectedCli, needsColabReauth]), {
     provider: 'mock',
     accountId: null,
     reason: 'offline',
   });
-  assert.deepEqual(request({ real_enabled: false, offline_mode: false }, [connectedCli]), {
+  assert.deepEqual(request({ real_enabled: false, offline_mode: false }, [connectedCli, needsColabReauth]), {
     provider: 'mock',
     accountId: null,
     reason: 'real_disabled',

@@ -14,7 +14,7 @@ from fastapi.responses import JSONResponse
 
 from .common import APIError, current_user, envelope, ok
 from .gpu.accounts import AccountService
-from .gpu.google import GoogleError, GoogleOAuthError
+from .gpu.google import GoogleConfigurationError, GoogleError, GoogleOAuthError
 from .gpu.repository import Repository
 
 router = APIRouter(prefix="/api/gpu/accounts", tags=["gpu-accounts"])
@@ -67,6 +67,8 @@ def _invoke(request: Request, action: Callable):
         return _error_response(request, exc)
     except GoogleOAuthError as exc:
         return _error_response(request, APIError("GOOGLE_OAUTH_ERROR", str(exc), 422))
+    except GoogleConfigurationError as exc:
+        return _error_response(request, APIError("GOOGLE_CONFIG_ERROR", str(exc), status=422, retryable=False))
     except GoogleError as exc:
         return _error_response(request, APIError("GOOGLE_ACCOUNT_ERROR", str(exc), 503, True))
 

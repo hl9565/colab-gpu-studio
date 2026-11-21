@@ -31,7 +31,7 @@ from .config import settings
 from .db import Store
 from .gpu import loras as lora_registry
 from .gpu.compute import GpuConfig, MockColabProvider
-from .gpu.google import GoogleError
+from .gpu.google import GoogleConfigurationError, GoogleError, GoogleOAuthError, GoogleTransientError
 from .gpu.manifest import bind_parameters, resolve_parameters, validate_manifest
 from .gpu.rates import estimate as estimate_units
 from .gpu.rates import mode_param
@@ -752,13 +752,17 @@ def compute_specs(
         raise APIError("REAL_GPU_DISABLED", "真实 GPU 未启用，不能连接 Colab。可改查模拟 GPU。", status=409)
     repo = Repository(st)
     _require_account(repo, user["id"], account_id, require_allocation=False)
-    from .gpu.colab import GoogleColabProvider
+    from .gpu.colab import ColabError, GoogleColabProvider
 
     try:
         return ok(GoogleColabProvider(repo, user["id"], account_id=account_id or None).list_specs(), request)
     except APIError:
         raise
-    except Exception as exc:
+    except GoogleOAuthError as exc:
+        raise APIError("GOOGLE_OAUTH_ERROR", str(exc)[:160], status=422, retryable=False) from exc
+    except GoogleConfigurationError as exc:
+        raise APIError("GOOGLE_CONFIG_ERROR", str(exc)[:160], status=422, retryable=False) from exc
+    except (GoogleTransientError, ColabError) as exc:
         raise APIError("COLAB_CHECK_FAILED", f"检查 Colab GPU 失败：{str(exc)[:160]}", status=502, retryable=True) from exc
 
 
@@ -899,7 +903,16 @@ app.include_router(oauth_config_router)
 
 @app.exception_handler(GoogleError)
 async def google_error(request, exc):
-    return error_response(request, APIError("GOOGLE_REQUEST_FAILED", str(exc)[:250], 422))
+    message = str(exc)[:250]
+    if isinstance(exc, GoogleOAuthError):
+        error = APIError("GOOGLE_OAUTH_ERROR", message, status=422, retryable=False)
+    elif isinstance(exc, GoogleConfigurationError):
+        error = APIError("GOOGLE_CONFIG_ERROR", message, status=422, retryable=False)
+    elif isinstance(exc, GoogleTransientError):
+        error = APIError("GOOGLE_TRANSIENT_ERROR", message, status=502, retryable=True)
+    else:
+        error = APIError("GOOGLE_REQUEST_FAILED", message, status=422)
+    return error_response(request, error)
 
 
 router.include_router(build_batch_router(JobInput, admit_job, public_job))

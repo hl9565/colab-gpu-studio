@@ -215,7 +215,9 @@ function NewProjectDialog({
 
 export default function App() {
   const [loggedIn, setLoggedIn] = useState(isLoggedIn());
-  const [tab, setTab] = useState<Tab>('创作');
+  const [tab, setActiveTab] = useState<Tab>('创作');
+  const activeTab = useRef(tab);
+  const gpuCheckSequence = useRef(0);
   const [projects, setProjects] = useState<Project[]>([]);
   const [projectId, setProjectId] = useState('');
   const [showProjectSheet, setShowProjectSheet] = useState(false);
@@ -573,6 +575,15 @@ export default function App() {
     }
   }
 
+  function setTab(next: Tab) {
+    if (activeTab.current === next) return;
+    activeTab.current = next;
+    gpuCheckSequence.current += 1;
+    setError('');
+    setLoading((current) => current === 'check' ? '' : current);
+    setActiveTab(next);
+  }
+
   async function action(name: string, operation: () => Promise<unknown>) {
     setLoading(name);
     setError('');
@@ -651,9 +662,14 @@ export default function App() {
   }
 
   async function checkGpu() {
+    const sequence = ++gpuCheckSequence.current;
+    const sourceTab = tab;
+    const isCurrent = () => gpuCheckSequence.current === sequence && activeTab.current === sourceTab;
     setSpecs([]);
     setSpecsNote('');
-    await action('check', async () => {
+    setError('');
+    setLoading('check');
+    try {
       // Fetch after the click so login polling and recent authorizations cannot
       // turn a not-yet-loaded account directory into a disconnected result.
       const [currentAccounts, currentSettings] = await Promise.all([
@@ -662,10 +678,17 @@ export default function App() {
       ]);
       setAccounts(uniqueBy(currentAccounts, (account) => account.account_id));
       setSettings(currentSettings);
+      if (!isCurrent()) return;
       const checkRequest = resolveGpuCheckRequest(currentSettings, currentAccounts, runtimeChoice.accountId || null);
+      if (checkRequest.provider === 'reauth') {
+        setError(checkRequest.message);
+        return;
+      }
       if (checkRequest.provider === 'mock') {
         // 真实 GPU 没启用、离线或没有可用账号：明确改查模拟，不假装查了真实机器
-        setSpecs(await getGpuComputeSpecs('mock'));
+        const mockSpecs = await getGpuComputeSpecs('mock');
+        if (!isCurrent()) return;
+        setSpecs(mockSpecs);
         setSpecsNote(checkRequest.reason === 'offline'
           ? '站点处于离线测试模式，下面是「模拟」GPU，不是真实 Colab 机器。'
           : checkRequest.reason === 'real_disabled'
@@ -675,11 +698,26 @@ export default function App() {
               : '账号池没有已连接且启用的 Google 账号，下面是「模拟」GPU。请先到「设置」完成授权。');
         return;
       }
-      setSpecs(await getGpuComputeSpecs('colab', checkRequest.accountId));
+      try {
+        const colabSpecs = await getGpuComputeSpecs('colab', checkRequest.accountId);
+        if (!isCurrent()) return;
+        setSpecs(colabSpecs);
+      } catch (cause) {
+        if (cause instanceof ApiError && cause.code === 'GOOGLE_OAUTH_ERROR') {
+          await apiFetch<GpuAccount[]>('/api/gpu/accounts')
+            .then((updated) => setAccounts(uniqueBy(updated, (account) => account.account_id)))
+            .catch(() => undefined);
+        }
+        throw cause;
+      }
       setSpecsNote(runtimeChoice.accountId
         ? '已查询所选 Google 账号的 Colab：有申请资格不等于现在一定有空闲 GPU。'
         : '已按账号池选择 Google 账号并查询 Colab：有申请资格不等于现在一定有空闲 GPU。');
-    });
+    } catch (cause) {
+      if (isCurrent()) setError(apiMessage(cause));
+    } finally {
+      if (isCurrent()) setLoading((current) => current === 'check' ? '' : current);
+    }
   }
 
   async function stopCompute() {
