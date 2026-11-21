@@ -11,11 +11,13 @@ export function createProjectJobsController(projectId: string, {
 }) {
   let alive = true;
   let sequence = 0;
+  let inFlight = 0;
   const isCurrent = (request: number) => alive && request === sequence;
 
-  async function refreshJobs() {
-    if (!alive) return;
+  async function refreshJobs({ source = 'manual' }: { source?: 'manual' | 'poll' } = {}) {
+    if (!alive || (source === 'poll' && inFlight > 0)) return;
     const request = ++sequence;
+    inFlight += 1;
     setRefreshingJobs(true);
     try {
       const next = await loadJobs(projectId);
@@ -25,6 +27,7 @@ export function createProjectJobsController(projectId: string, {
     } catch (cause) {
       if (isCurrent(request)) setJobError(apiMessage(cause));
     } finally {
+      inFlight -= 1;
       if (isCurrent(request)) setRefreshingJobs(false);
     }
   }
@@ -51,7 +54,7 @@ export function useProjectJobs(projectId: string, loggedIn: boolean) {
     });
     active.current = { projectId, refreshJobs: controller.refreshJobs };
     void controller.refreshJobs();
-    const timer = window.setInterval(() => void controller.refreshJobs(), 4000);
+    const timer = window.setInterval(() => void controller.refreshJobs({ source: 'poll' }), 4000);
     return () => {
       controller.dispose();
       active.current = null;

@@ -29,12 +29,22 @@ export function createStudioResourcesController({
 }) {
   let alive = true;
   let sequence = 0;
+  let inFlight = 0;
 
-  async function refreshResources() {
-    if (!alive) return;
+  async function loadResource<T>(load: () => Promise<T>) {
+    inFlight += 1;
+    try {
+      return await load();
+    } finally {
+      inFlight -= 1;
+    }
+  }
+
+  async function refreshResources({ source = 'manual' }: { source?: 'manual' | 'poll' } = {}) {
+    if (!alive || (source === 'poll' && inFlight > 0)) return;
     const request = ++sequence;
     try {
-      const [accounts, instances] = await Promise.all([loadAccounts(), loadInstances()]);
+      const [accounts, instances] = await Promise.all([loadResource(loadAccounts), loadResource(loadInstances)]);
       if (!alive || request !== sequence) return;
       const nextAccounts = uniqueBy(readAccounts(accounts), (account) => account.account_id);
       const nextInstances = uniqueBy(instances, (instance) => instance.instance_id || instance.id || '');
@@ -64,7 +74,7 @@ export function useStudioResources(loggedIn: boolean) {
     });
     refresh.current = controller.refreshResources;
     void controller.refreshResources();
-    const timer = window.setInterval(() => void controller.refreshResources(), 5000);
+    const timer = window.setInterval(() => void controller.refreshResources({ source: 'poll' }), 5000);
     return () => {
       controller.dispose();
       refresh.current = null;

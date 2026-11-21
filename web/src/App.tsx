@@ -25,6 +25,7 @@ import { jobStateLabel } from './lib/job-stage-rows';
 import { jobDetailTimings, paramRows, stageSecondsTotal, taskStatusNote } from './lib/job-detail-copy';
 import { resolveInstanceSubmission } from './lib/instance-submission';
 import { projectOptionLabel } from './lib/project-label';
+import { belongsToProject, projectGallery, projectViewer, runProjectAssetAction, startProjectGalleryLoad } from './lib/gallery-scope';
 import { carriedDraft, mergeWorkflowDraft, readWorkflowDraft, writeWorkflowDraft } from './lib/workflow-draft';
 import { formatInstanceTime } from './lib/instance-time';
 import { JobHistoryDetails } from './components/JobHistoryDetails';
@@ -244,7 +245,8 @@ export default function App() {
   const [uploadProgress, setUploadProgress] = useState<Record<string, number>>({});
   const [confirm, setConfirm] = useState<'submit' | 'stop' | null>(null);
   const [detail, setDetail] = useState<GpuJob | null>(null);
-  const [viewer, setViewer] = useState<GalleryAsset | null>(null);
+  const [viewerAsset, setViewer] = useState<GalleryAsset | null>(null);
+  const viewer = projectViewer(viewerAsset, projectId);
   const [againJob, setAgainJob] = useState<GpuJob | null>(null);
   const [loginRefresh, setLoginRefresh] = useState(0);
   const idempotencyKey = useRef('');
@@ -373,14 +375,16 @@ export default function App() {
   useEffect(() => {
     setSelectedAssets([]);
   }, [workflowId,projectId]);
-
-
+  useEffect(() => {
+    setGallery([]);
+    setViewer((curr) => projectViewer(curr, loggedIn ? projectId : ''));
+  }, [projectId, loggedIn]);
 
   useEffect(() => {
     if (!projectId || !loggedIn) return;
-    let alive = true;
-    getGpuGallery(projectId).then((next) => alive && setGallery(next)).catch((cause) => alive && setError(`作品：${apiMessage(cause)}`));
-    return () => { alive = false; };
+    return startProjectGalleryLoad(projectId, {
+      loadGallery: getGpuGallery, setGallery, onError: (cause) => setError(`作品：${apiMessage(cause)}`),
+    });
   }, [projectId, loggedIn, tab]);
 
   useEffect(() => {
@@ -548,23 +552,29 @@ export default function App() {
     }
   }
 
-  async function favorite(asset: GalleryAsset) {
-    try {
-      const next = await updateAsset(asset.id, !asset.favorite);
-      setGallery((curr) => curr.map((i) => i.id === next.id ? next : i));
-    } catch (cause) {
-      setError(apiMessage(cause));
-    }
+  function favorite(asset: GalleryAsset) {
+    return runProjectAssetAction(asset, currentProjectId.current, async () => {
+      try {
+        const next = await updateAsset(asset.id, !asset.favorite);
+        if (!belongsToProject(next, currentProjectId.current) || next.project_id !== asset.project_id) return;
+        setGallery((curr) => curr.map((item) => item.id === next.id && item.project_id === asset.project_id ? next : item));
+      } catch (cause) {
+        if (belongsToProject(asset, currentProjectId.current)) setError(apiMessage(cause));
+      }
+    });
   }
 
-  async function remove(asset: GalleryAsset) {
-    try {
-      await deleteAsset(asset.id);
-      setGallery((curr) => curr.filter((i) => i.id !== asset.id));
-      setViewer(null);
-    } catch (cause) {
-      setError(`删除失败：${apiMessage(cause)}`);
-    }
+  function remove(asset: GalleryAsset) {
+    return runProjectAssetAction(asset, currentProjectId.current, async () => {
+      try {
+        await deleteAsset(asset.id);
+        if (!belongsToProject(asset, currentProjectId.current)) return;
+        setGallery((curr) => curr.filter((item) => item.id !== asset.id || item.project_id !== asset.project_id));
+        setViewer((curr) => curr?.id === asset.id && curr.project_id === asset.project_id ? null : curr);
+      } catch (cause) {
+        if (belongsToProject(asset, currentProjectId.current)) setError(`删除失败：${apiMessage(cause)}`);
+      }
+    });
   }
 
   async function savePreset(name: string) {
@@ -828,7 +838,7 @@ export default function App() {
 
         {tab === '作品' && (
           <GalleryPanel
-            gallery={gallery}
+            gallery={projectGallery(gallery, projectId)}
             onFavorite={(asset) => void favorite(asset)}
             onDelete={(asset) => void remove(asset)}
             onOpen={setViewer}

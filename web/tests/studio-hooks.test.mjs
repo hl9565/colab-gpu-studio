@@ -56,8 +56,10 @@ function jobsHarness() {
 
 test('resources accept both account shapes and keep the newer deduplicated snapshot', async () => {
   const { state, accounts, instances, refreshResources } = resourceHarness();
-  const poll = refreshResources();
+  const poll = refreshResources({ source: 'poll' });
   const manual = refreshResources();
+  assert.equal(accounts.length, 2);
+  assert.equal(instances.length, 2);
   const account = { account_id: 'account-a', alias: 'current' };
   const instance = { instance_id: 'instance-a', id: 'alternate-id' };
   const legacyInstance = { id: 'instance-b' };
@@ -77,6 +79,48 @@ test('resources accept both account shapes and keep the newer deduplicated snaps
   instances[2].resolve([instance]);
   await direct;
   assert.deepEqual(state, { accounts: [account], instances: [instance], resourceError: '' });
+});
+
+test('resources skip polling ticks while a slow refresh is pending and resume after it publishes', async () => {
+  const { state, accounts, instances, refreshResources } = resourceHarness();
+  const slow = refreshResources();
+  await refreshResources({ source: 'poll' });
+  const account = { account_id: 'account-a' };
+  const instance = { id: 'instance-a' };
+  accounts[0].resolve([account]);
+  await refreshResources({ source: 'poll' });
+  assert.equal(accounts.length, 1);
+  assert.equal(instances.length, 1);
+  assert.deepEqual(state, { accounts: [], instances: [], resourceError: '' });
+
+  instances[0].resolve([instance]);
+  await slow;
+  assert.deepEqual(state, { accounts: [account], instances: [instance], resourceError: '' });
+
+  const poll = refreshResources({ source: 'poll' });
+  accounts[1].resolve([]);
+  instances[1].resolve([]);
+  await poll;
+  assert.deepEqual(state, { accounts: [], instances: [], resourceError: '' });
+});
+
+test('resources skip polling while a failed refresh still has an outstanding sibling request', async () => {
+  const { state, accounts, instances, refreshResources } = resourceHarness();
+  const failure = refreshResources();
+  accounts[0].reject(new Error('账号读取失败'));
+  await failure;
+  assert.equal(state.resourceError, '账号/实例：账号读取失败');
+  await refreshResources({ source: 'poll' });
+  assert.equal(accounts.length, 1);
+  assert.equal(instances.length, 1);
+
+  instances[0].resolve([]);
+  await Promise.resolve();
+  const poll = refreshResources({ source: 'poll' });
+  accounts[1].resolve([]);
+  instances[1].resolve([]);
+  await poll;
+  assert.equal(state.resourceError, '');
 });
 
 test('resources only publish the newest error and clear it on success', async () => {
@@ -109,8 +153,9 @@ test('resources only publish the newest error and clear it on success', async ()
 test('jobs polling and manual refresh share sequence protection for list, error, and loading', async () => {
   const { state, requests, forProject } = jobsHarness();
   const { refreshJobs } = forProject('project-a');
-  const poll = refreshJobs();
+  const poll = refreshJobs({ source: 'poll' });
   const manual = refreshJobs();
+  assert.equal(requests.length, 2);
   const currentJob = { id: 'manual', project_id: 'project-a' };
   requests[1].resolve([currentJob]);
   await manual;
@@ -121,7 +166,7 @@ test('jobs polling and manual refresh share sequence protection for list, error,
   await poll;
   assert.deepEqual(state, current);
 
-  const staleFailure = refreshJobs();
+  const staleFailure = refreshJobs({ source: 'poll' });
   const pendingManual = refreshJobs();
   requests[2].reject(new Error('过期轮询'));
   await staleFailure;
@@ -131,10 +176,30 @@ test('jobs polling and manual refresh share sequence protection for list, error,
   assert.deepEqual(state, current);
 });
 
+test('jobs skip polling ticks while a slow refresh is pending without invalidating it', async () => {
+  const { state, requests, forProject } = jobsHarness();
+  const { refreshJobs } = forProject('project-a');
+  const slow = refreshJobs();
+  await refreshJobs({ source: 'poll' });
+  await refreshJobs({ source: 'poll' });
+  assert.equal(requests.length, 1);
+  assert.deepEqual(state, { jobs: [], jobError: '', refreshingJobs: true });
+
+  const job = { id: 'slow', project_id: 'project-a' };
+  requests[0].resolve([job]);
+  await slow;
+  assert.deepEqual(state, { jobs: [job], jobError: '', refreshingJobs: false });
+
+  const poll = refreshJobs({ source: 'poll' });
+  requests[1].resolve([]);
+  await poll;
+  assert.deepEqual(state, { jobs: [], jobError: '', refreshingJobs: false });
+});
+
 test('jobs preserve the newest failure until a later refresh succeeds', async () => {
   const { state, requests, forProject } = jobsHarness();
   const { refreshJobs } = forProject('project-a');
-  const poll = refreshJobs();
+  const poll = refreshJobs({ source: 'poll' });
   const manual = refreshJobs();
   requests[1].reject(new Error('任务读取失败'));
   await manual;
@@ -152,7 +217,7 @@ test('jobs preserve the newest failure until a later refresh succeeds', async ()
 test('switching project disposes old requests and filters the new project response', async () => {
   const { state, requests, forProject } = jobsHarness();
   const previous = forProject('project-a');
-  const oldPoll = previous.refreshJobs();
+  const oldPoll = previous.refreshJobs({ source: 'poll' });
   const oldManual = previous.refreshJobs();
   previous.dispose();
 
