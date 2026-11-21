@@ -100,6 +100,47 @@ def test_callback_derives_owner_from_single_use_state_and_encrypts_tokens(monkey
         service.callback("code-1", started["state"])
 
 
+@pytest.mark.parametrize(("next_client_id", "legacy", "reuse_allowed"), [
+    ("client-b", False, False),
+    ("client-id", True, False),
+    ("client-id", False, True),
+], ids=["different-web-client", "legacy-credential", "same-web-client"])
+def test_callback_refresh_reuse_requires_same_issuing_web_client(monkeypatch, next_client_id, legacy, reuse_allowed):
+    configured(monkeypatch)
+    repo = MemoryRepository()
+    payload = {"access_token": "first-access", "refresh_token": "first-refresh"}
+
+    def handler(request):
+        assert parse_qs(request.content.decode())["client_id"] == [expected_client_id]
+        return httpx.Response(200, json=payload)
+
+    expected_client_id = "client-id"
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        service = GoogleService(repo, "owner-1", client=client)
+        if legacy:
+            previous = refresh_credential(repo, account_id=None)
+            assert "issued_client_id" not in previous
+        else:
+            assert service.callback("first-code", service.start("colab")["state"])["connected"] is True
+            previous, = [row for row in repo.list("credentials") if row.get("purpose") == "colab"]
+            assert previous["issued_client_id"] == "client-id"
+
+        expected_client_id = next_client_id
+        monkeypatch.setenv("GPU_GOOGLE_CLIENT_ID", next_client_id)
+        payload = {"access_token": "second-access"}
+        state = service.start("colab")["state"]
+        if reuse_allowed:
+            assert service.callback("second-code", state)["connected"] is True
+            updated = repo.get("credentials", previous["id"], "owner-1")
+            assert updated["issued_client_id"] == "client-id"
+            assert decrypt_secret(updated["encrypted_refresh_token"]) == "first-refresh"
+            assert decrypt_secret(updated["encrypted_access_token"]) == "second-access"
+        else:
+            with pytest.raises(GoogleOAuthError, match="Google OAuth未返回可持久化刷新凭证，请重新授权"):
+                service.callback("second-code", state)
+            assert repo.get("credentials", previous["id"], "owner-1") == previous
+
+
 def test_refresh_preserves_existing_refresh_token(monkeypatch):
     configured(monkeypatch)
     from app.security import encrypt_secret
@@ -256,8 +297,8 @@ def test_reauth_required_skips_cached_token_network_and_writes(monkeypatch, stor
 def test_callback_requires_new_refresh_for_flagged_credential_and_clears_cli_binding(monkeypatch):
     configured(monkeypatch)
     repo = MemoryRepository()
-    target = refresh_credential(repo, reauth_required=True, reauth_message="old message", client_id="old-cli",
-                                encrypted_client_secret=encrypt_secret("old-cli-secret"))
+    target = refresh_credential(repo, reauth_required=True, reauth_message="old message",
+                                issued_client_id="client-id")
     payload = {"access_token": "authorized-access", "expires_in": 3600}
     with httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(200, json=payload))) as client:
         service = GoogleService(repo, "owner-1", account_id="primary", client=client)
@@ -265,6 +306,9 @@ def test_callback_requires_new_refresh_for_flagged_credential_and_clears_cli_bin
             service.callback("code", service.start("colab")["state"])
         assert repo.get("credentials", target["id"], "owner-1") == target
 
+        repo.update("credentials", target["id"], {
+            "client_id": "old-cli", "encrypted_client_secret": encrypt_secret("old-cli-secret"),
+        }, "owner-1")
         payload["refresh_token"] = "authorized-refresh"
         assert service.callback("code", service.start("colab")["state"])["connected"] is True
         updated = repo.get("credentials", target["id"], "owner-1")
@@ -274,13 +318,39 @@ def test_callback_requires_new_refresh_for_flagged_credential_and_clears_cli_bin
         assert service.access_token("colab") == "authorized-access"
 
 
-@pytest.mark.parametrize(("refresh_status", "intervening_action", "expected_error"), [
-    (401, "reauthorize", "Google 授权已失效，请重新授权"),
-    (200, "disconnect", "Google OAuth未连接，真实GPU能力已关闭"),
-    (200, "reauthorize", None),
+@pytest.mark.parametrize(("client_id", "client_secret"), [
+    ("old-cli", "client-secret"),
+    ("client-id", "old-cli-secret"),
+])
+def test_callback_rejects_refresh_reuse_for_different_cli_client(monkeypatch, client_id, client_secret):
+    configured(monkeypatch)
+    monkeypatch.delenv("GPU_GOOGLE_SECRET", raising=False)
+    repo = MemoryRepository()
+    target = refresh_credential(repo, issued_client_id="client-id", client_id=client_id,
+                                encrypted_client_secret=encrypt_secret(client_secret))
+
+    def handler(request):
+        assert parse_qs(request.content.decode())["client_id"] == ["client-id"]
+        return httpx.Response(200, json={"access_token": "web-access"})
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        service = GoogleService(repo, "owner-1", account_id="primary", client=client)
+        with pytest.raises(GoogleOAuthError, match="Google OAuth未返回可持久化刷新凭证，请重新授权"):
+            service.callback("code", service.start("colab")["state"])
+    assert repo.get("credentials", target["id"], "owner-1") == target
+
+
+@pytest.mark.parametrize(("refresh_status", "oauth_error", "intervening_action", "expected_error"), [
+    (401, None, "reauthorize", None),
+    (400, "invalid_grant", "reauthorize", None),
+    (400, "invalid_client", "reauthorize", None),
+    (400, "unauthorized_client", "reauthorize", None),
+    (401, None, "disconnect", "Google OAuth未连接，真实GPU能力已关闭"),
+    (200, None, "disconnect", "Google OAuth未连接，真实GPU能力已关闭"),
+    (200, None, "reauthorize", None),
 ])
 def test_real_sqlite_stale_refresh_does_not_overwrite_new_credential(
-    monkeypatch, tmp_path, refresh_status, intervening_action, expected_error,
+    monkeypatch, tmp_path, refresh_status, oauth_error, intervening_action, expected_error,
 ):
     configured(monkeypatch)
     url = f"sqlite:///{tmp_path / 'refresh-race.sqlite'}"
@@ -292,7 +362,8 @@ def test_real_sqlite_stale_refresh_does_not_overwrite_new_credential(
         assert parse_qs(request.content.decode())["refresh_token"] == ["old-refresh"]
         refresh_started.set()
         assert release_refresh.wait(timeout=5)
-        return httpx.Response(refresh_status, json={"access_token": "stale-access", "refresh_token": "stale-refresh"})
+        payload = {"access_token": "stale-access", "refresh_token": "stale-refresh"}
+        return httpx.Response(refresh_status, json={"error": oauth_error} if oauth_error else payload)
 
     def new_authorization(request):
         return httpx.Response(200, json={"access_token": "fresh-access", "refresh_token": "fresh-refresh"})
@@ -437,7 +508,8 @@ def test_real_sqlite_state_is_exchanged_once_concurrently(monkeypatch, tmp_path)
     assert exchanges == 1
 
 
-def test_disconnect_clears_local_tokens_when_remote_revoke_fails(monkeypatch):
+@pytest.mark.parametrize("with_confirmation", [False, True])
+def test_disconnect_clears_local_tokens_when_remote_revoke_fails(monkeypatch, with_confirmation):
     configured(monkeypatch)
     repo = MemoryRepository()
     repo.create(
@@ -457,7 +529,10 @@ def test_disconnect_clears_local_tokens_when_remote_revoke_fails(monkeypatch):
         return httpx.Response(503, text="upstream body must not escape")
 
     service = GoogleService(repo, "owner-1", client=httpx.Client(transport=httpx.MockTransport(handler)))
-    assert service.disconnect("drive") is True
+    if with_confirmation:
+        assert service.disconnect_with_confirmation("drive") == (True, False)
+    else:
+        assert service.disconnect("drive") is True
     row = repo.rows["credentials"][0]
     assert row["encrypted_access_token"] is None and row["encrypted_refresh_token"] is None
     assert row["disconnect_status"] == "remote_unconfirmed"

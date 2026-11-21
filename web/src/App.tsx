@@ -388,6 +388,10 @@ export default function App() {
   }, [projectId, loggedIn, tab]);
 
   useEffect(() => {
+    if (againJob && againJob.project_id !== projectId) {
+      setAgainJob(null);
+      return;
+    }
     if (againJob && (againJob.resolved_params || againJob.params)) {
       const restored = { ...(againJob.resolved_params || againJob.params) };
       setModelId(String(againJob.model_id || ''));
@@ -398,7 +402,7 @@ export default function App() {
       setAgainJob(null);
       setTab('创作');
     }
-  }, [againJob, workflows]);
+  }, [againJob, projectId, workflows]);
 
   function chooseProject(id: string) {
     setProjectId(id);
@@ -540,15 +544,19 @@ export default function App() {
   }
 
   async function reuseAsset(asset: GalleryAsset) {
+    const sourceProjectId = currentProjectId.current;
+    if (!belongsToProject(asset, sourceProjectId)) return;
     const sourceJobId = asset.source_job_id || asset.gpu_job_id;
     if (!sourceJobId) {
       setError('该素材没有来源任务记录。');
       return;
     }
     try {
-      setAgainJob(await getGpuJob(sourceJobId));
+      const job = await getGpuJob(sourceJobId);
+      if (currentProjectId.current !== sourceProjectId || job.project_id !== sourceProjectId) return;
+      setAgainJob(job);
     } catch (cause) {
-      setError(`再次生成：${apiMessage(cause)}`);
+      if (currentProjectId.current === sourceProjectId) setError(`再次生成：${apiMessage(cause)}`);
     }
   }
 
@@ -608,9 +616,9 @@ export default function App() {
         apiFetch<GpuAccount[]>('/api/gpu/accounts'),
         getGpuSettings(),
       ]);
+      if (!isCurrent()) return;
       setAccounts(uniqueBy(currentAccounts, (account) => account.account_id));
       setSettings(currentSettings);
-      if (!isCurrent()) return;
       const checkRequest = resolveGpuCheckRequest(currentSettings, currentAccounts, runtimeChoice.accountId || null);
       if (checkRequest.provider === 'reauth') {
         setError(checkRequest.message);
@@ -635,9 +643,11 @@ export default function App() {
         if (!isCurrent()) return;
         setSpecs(colabSpecs);
       } catch (cause) {
-        if (cause instanceof ApiError && cause.code === 'GOOGLE_OAUTH_ERROR') {
+        if (isCurrent() && cause instanceof ApiError && cause.code === 'GOOGLE_OAUTH_ERROR') {
           await apiFetch<GpuAccount[]>('/api/gpu/accounts')
-            .then((updated) => setAccounts(uniqueBy(updated, (account) => account.account_id)))
+            .then((updated) => {
+              if (isCurrent()) setAccounts(uniqueBy(updated, (account) => account.account_id));
+            })
             .catch(() => undefined);
         }
         throw cause;

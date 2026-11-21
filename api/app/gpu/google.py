@@ -391,7 +391,21 @@ class GoogleService:
             raise GoogleOAuthError("Google OAuth响应无效")
         old = self._credential(row.get("oauth_purpose"), row.get("owner_id"), row.get("account_id"))
         if not refresh and old:
-            if old.get("reauth_required") is True:
+            old_client_id = str(old.get("client_id") or "").strip()
+            old_client_secret = old.get("encrypted_client_secret")
+            client_mismatch = bool(old_client_id and old_client_id != client_id)
+            if old_client_secret and not client_mismatch:
+                try:
+                    client_mismatch = (
+                        not isinstance(old_client_secret, str) or decrypt_secret(old_client_secret) != client_secret
+                    )
+                except ValueError:
+                    client_mismatch = True
+            if (
+                old.get("reauth_required") is True
+                or client_mismatch
+                or str(old.get("issued_client_id") or "").strip() != client_id
+            ):
                 raise GoogleOAuthError("Google OAuth未返回可持久化刷新凭证，请重新授权")
             old_refresh = old.get("encrypted_refresh_token")
             if isinstance(old_refresh, str) and old_refresh:
@@ -411,6 +425,7 @@ class GoogleService:
             "token_type": payload.get("token_type", "Bearer"),
             "reauth_required": False,
             "reauth_message": None,
+            "issued_client_id": client_id,
             "client_id": None,
             "encrypted_client_secret": None,
             **({"account_id": row.get("account_id")} if row.get("account_id") is not None else {}),
@@ -486,9 +501,11 @@ class GoogleService:
                 message = _REAUTH_MESSAGE
             else:
                 raise GoogleTransientError(_INVALID_REFRESH_RESPONSE)
-            self._update_refresh_credential(credential, expected_version, {
+            updated = self._update_refresh_credential(credential, expected_version, {
                 "reauth_required": True, "reauth_message": message,
             })
+            if updated is None:
+                return self._current_access_token(purpose)
             raise GoogleOAuthError(message)
         try:
             payload = response.json()
@@ -516,7 +533,9 @@ class GoogleService:
         )
         if updated is not None:
             return new_access
+        return self._current_access_token(purpose)
 
+    def _current_access_token(self, purpose: str) -> str:
         current = self._credential(purpose, account_id=self.account_id)
         if not current:
             raise GoogleOAuthError("Google OAuth未连接，真实GPU能力已关闭")
@@ -527,17 +546,25 @@ class GoogleService:
         if float(current.get("expires_at", 0)) <= self.clock():
             raise GoogleOAuthError(_REAUTH_MESSAGE)
         try:
-            current_access, _refresh = self._decrypt_tokens(current)
+            encrypted_access = current.get("encrypted_access_token")
+            if not isinstance(encrypted_access, str) or not encrypted_access:
+                raise ValueError(_UNUSABLE_CREDENTIAL_MESSAGE)
+            current_access = decrypt_secret(encrypted_access)
+            if not current_access:
+                raise ValueError(_UNUSABLE_CREDENTIAL_MESSAGE)
         except ValueError as exc:
             raise GoogleOAuthError(_UNUSABLE_CREDENTIAL_MESSAGE) from exc
         return current_access
 
     def disconnect(self, purpose: str) -> bool:
+        return self.disconnect_with_confirmation(purpose)[0]
+
+    def disconnect_with_confirmation(self, purpose: str) -> tuple[bool, bool]:
         if purpose not in _PURPOSES:
             raise ValueError("Google OAuth purpose无效")
         credential = self._credential(purpose, account_id=self.account_id)
         if not credential:
-            return False
+            return False, False
         remote_confirmed = False
         try:
             refresh = decrypt_secret(credential.get("encrypted_refresh_token", ""))
@@ -564,7 +591,7 @@ class GoogleService:
             },
             self.owner_id,
         )
-        return True
+        return True, remote_confirmed
 
     def close(self) -> None:
         if self._owns_client:

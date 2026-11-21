@@ -326,7 +326,13 @@ class AccountService:
         ]
         if active:
             raise APIError("ACCOUNT_HAS_ACTIVE_RESOURCES", "账号仍有活动资源，停止并确认收尾后再断开", 409)
-        credential_rows = [row for row in self._rows("credentials") if row.get("account_id") == account_id]
+        default_id = self.default_account_id(self.owner_id)
+        credential_rows = [
+            row
+            for row in self._rows("credentials")
+            if row.get("account_id") == account_id
+            or (account_id == default_id and row.get("account_id") in (None, ""))
+        ]
         if os.getenv("STUDIO_OFFLINE_TEST") == "1":
             for credential in credential_rows:
                 self.repo.update("credentials", credential["id"], {"revoked": True, "encrypted_access_token": None, "encrypted_refresh_token": None, "disconnect_status": "offline_unconfirmed"}, self.owner_id)
@@ -341,9 +347,18 @@ class AccountService:
         service = GoogleService(self.repo, self.owner_id, account_id=account_id)
         remote_confirmed = True
         for purpose in ("colab", "drive"):
-            had_credential = any(item.get("purpose") == purpose and not item.get("revoked") for item in credential_rows)
-            outcome = service.disconnect(purpose)
-            if had_credential and not outcome:
+            purpose_rows = [item for item in credential_rows if item.get("purpose") == purpose]
+            had_credential = any(not item.get("revoked") for item in purpose_rows)
+            was_unconfirmed = any(
+                item.get("revoked") is True
+                and (
+                    item.get("disconnect_remote_confirmed") is False
+                    or item.get("disconnect_status") in ("remote_unconfirmed", "offline_unconfirmed")
+                )
+                for item in purpose_rows
+            )
+            disconnected_locally, confirmed = service.disconnect_with_confirmation(purpose)
+            if was_unconfirmed or (had_credential and not (disconnected_locally and confirmed)):
                 remote_confirmed = False
         result = {"account_id": account_id, "disconnected": remote_confirmed, "remote_confirmed": remote_confirmed, "status": "confirmed" if remote_confirmed else "remote_unconfirmed"}
         try:

@@ -59,6 +59,48 @@ async function jsonBody(call) {
   return { request, body: JSON.parse(request.init.body) };
 }
 
+for (const [trigger, message] of [
+  ['parent abort', '请求已取消'],
+  ['timeout', '请求超时或网络中断，请刷新后再试'],
+]) {
+  test(`apiFetch handles ${trigger} while reading the response body`, { timeout: 1000 }, async () => {
+    const parent = new AbortController();
+    let fireTimeout;
+    let timerCleared = false;
+    window.setTimeout = (callback, delay) => {
+      assert.equal(delay, 15000);
+      fireTimeout = callback;
+      return 1;
+    };
+    window.clearTimeout = (timer) => {
+      assert.equal(timer, 1);
+      timerCleared = true;
+    };
+    let startReading;
+    const reading = new Promise((resolve) => { startReading = resolve; });
+    let fetchSignal;
+    globalThis.fetch = async (_url, { signal }) => {
+      fetchSignal = signal;
+      return {
+        ok: true,
+        text: () => new Promise((_resolve, reject) => {
+          signal.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), { once: true });
+          startReading();
+        }),
+      };
+    };
+
+    const pending = api.apiFetch('/body', { signal: parent.signal });
+    await reading;
+    assert.equal(timerCleared, false);
+    if (trigger === 'parent abort') parent.abort();
+    else fireTimeout();
+    assert.equal(fetchSignal.aborted, true);
+    await assert.rejects(pending, { code: 'NETWORK_TIMEOUT', message });
+    assert.equal(timerCleared, true);
+  });
+}
+
 test('exports the v0.2 account, instance, and workbench client functions', () => {
   for (const name of [
     'getGoogleAccounts', 'createGoogleAccount', 'updateGoogleAccount',

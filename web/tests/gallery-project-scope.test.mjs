@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { build } from 'esbuild';
@@ -65,4 +66,10 @@ test('an empty project hides all assets and denies mutations', async () => {
   assert.deepEqual(projectGallery([assetA, unscopedAsset], ''), []);
   assert.equal(projectViewer(unscopedAsset, ''), null);
   await runProjectAssetAction(unscopedAsset, '', async () => assert.fail('unscoped mutation'));
+});
+
+test('App guards gallery reuse before lookup, after lookup, and when restoring the draft', () => {
+  const app = readFileSync(new URL('../src/App.tsx', import.meta.url), 'utf8');
+  assert.match(app, /async function reuseAsset\(asset: GalleryAsset\) \{\s*const sourceProjectId = currentProjectId\.current;\s*if \(!belongsToProject\(asset, sourceProjectId\)\) return;[^]*?const job = await getGpuJob\(sourceJobId\);\s*if \(currentProjectId\.current !== sourceProjectId \|\| job\.project_id !== sourceProjectId\) return;\s*setAgainJob\(job\);/);
+  assert.match(app, /useEffect\(\(\) => \{\s*if \(againJob && againJob\.project_id !== projectId\) \{\s*setAgainJob\(null\);\s*return;\s*\}\s*if \(againJob[^]*?setParams\(restored\);[^]*?setTab\('创作'\);\s*\}\s*\}, \[againJob, projectId, workflows\]\);/);
 });

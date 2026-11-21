@@ -160,8 +160,11 @@ export async function apiFetch<T>(path: string, init: RequestInit = {}): Promise
   const abortParent = () => controller.abort();
   init.signal?.addEventListener('abort', abortParent, { once: true });
   let response: Response;
+  let text: string;
   try {
+    if (init.signal?.aborted) abortParent();
     response = await fetch(`${API_BASE}${path}`, { ...init, headers, credentials: 'include', signal: controller.signal });
+    text = await response.text();
   } catch (cause) {
     if (controller.signal.aborted) throw new ApiError(init.signal?.aborted ? '请求已取消' : '请求超时或网络中断，请刷新后再试', 0, 'NETWORK_TIMEOUT');
     throw cause;
@@ -169,7 +172,6 @@ export async function apiFetch<T>(path: string, init: RequestInit = {}): Promise
     window.clearTimeout(timeout);
     init.signal?.removeEventListener('abort', abortParent);
   }
-  const text = await response.text();
   let body: unknown = undefined;
   try { body = text ? JSON.parse(text) : undefined; } catch { body = text; }
   if (!response.ok) {

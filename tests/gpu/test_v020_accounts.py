@@ -10,7 +10,7 @@ from app.common import APIError
 from app.gpu.accounts import DEFAULT_ACCOUNT_NAMESPACE, AccountService
 from app.gpu.compute import GpuConfig, default_executor_factory, default_provider_factory
 from app.gpu.drive import DriveStorage
-from app.gpu.google import GoogleService
+from app.gpu.google import REVOKE_URL, GoogleService
 from app.security import decrypt_secret, encrypt_secret
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -134,6 +134,60 @@ def test_account_service_whitelist_default_migration_and_disconnect_guard():
     repo.create("instances", "owner-1", {"account_id": account["account_id"], "state": "ready", "current_job_id": None})
     with pytest.raises(APIError, match="资源"):
         service.disconnect(account["account_id"])
+
+
+@pytest.mark.parametrize("disconnect_purpose_first", [False, True])
+def test_account_disconnect_reports_google_revoke_failure(monkeypatch, disconnect_purpose_first):
+    monkeypatch.delenv("STUDIO_OFFLINE_TEST", raising=False)
+    repo = MemoryRepo()
+    service = AccountService(repo, "owner-1")
+    account_id = service.create({"alias": "实验"})["account_id"]
+    credential = repo.create("credentials", "owner-1", {
+        "provider": "google", "purpose": "colab", "account_id": account_id,
+        "encrypted_access_token": encrypt_secret("access"),
+        "encrypted_refresh_token": encrypt_secret("refresh"),
+    })
+    requests = []
+
+    def revoke(client, url, *, data):
+        requests.append((url, data))
+        return httpx.Response(503)
+
+    monkeypatch.setattr(httpx.Client, "post", revoke)
+    if disconnect_purpose_first:
+        google = GoogleService(repo, "owner-1", account_id=account_id)
+        assert google.disconnect("colab") is True
+        revoked = repo.get("credentials", credential["id"], "owner-1")
+        assert revoked["revoked"] is True
+        assert revoked["disconnect_remote_confirmed"] is False
+
+    result = service.disconnect(account_id)
+    assert requests == [(REVOKE_URL, {"token": "refresh"})]
+    assert result["remote_confirmed"] is False
+    assert result["status"] == "remote_unconfirmed"
+    updated = repo.get("credentials", credential["id"], "owner-1")
+    assert updated["revoked"] is True
+    assert updated["encrypted_access_token"] is None and updated["encrypted_refresh_token"] is None
+
+
+def test_default_account_disconnect_preserves_unconfirmed_legacy_credential(monkeypatch):
+    monkeypatch.delenv("STUDIO_OFFLINE_TEST", raising=False)
+    repo = MemoryRepo()
+    service = AccountService(repo, "owner-1")
+    default_id = service.default_account_id("owner-1")
+    repo.create("accounts", "owner-1", {"account_id": default_id, "alias": "默认账号", "enabled": True}, record_id=default_id)
+    credential = repo.create("credentials", "owner-1", {
+        "provider": "google", "purpose": "colab",
+        "encrypted_access_token": encrypt_secret("legacy-access"),
+        "encrypted_refresh_token": encrypt_secret("legacy-refresh"),
+    })
+    monkeypatch.setattr(httpx.Client, "post", lambda client, url, *, data: httpx.Response(503))
+
+    assert GoogleService(repo, "owner-1", account_id=default_id).disconnect("colab") is True
+    result = service.disconnect(default_id)
+    assert result["remote_confirmed"] is False
+    assert result["status"] == "remote_unconfirmed"
+    assert repo.get("credentials", credential["id"], "owner-1")["disconnect_remote_confirmed"] is False
 
 
 def test_account_route_requires_idempotency_and_is_idempotent():
